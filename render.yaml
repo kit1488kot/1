@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: payment-bot
+    env: docker
+    plan: free
+    healthCheckPath: /ping
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
