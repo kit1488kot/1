@@ -4,6 +4,7 @@ import sqlite3
 import asyncio
 import aiohttp
 import random
+import json
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -12,7 +13,6 @@ from aiogram.utils import executor
 from playwright.async_api import async_playwright
 from flask import Flask
 import threading
-import json
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -194,32 +194,31 @@ async def get_rotated_proxy():
         pass
     return get_setting('proxy')
 
-# ========== ПРОВЕРКА ПРОКСИ ЧЕРЕЗ WHOER ==========
+# ========== ПРОВЕРКА ПРОКСИ ЧЕРЕЗ API.IPIFY ==========
 async def check_proxy(proxy_str: str) -> tuple:
     """
-    Проверяет прокси через whoer.net.
-    Возвращает (True, тип_прокси, страна, IP) если успешно.
+    Проверяет прокси через api.ipify.org.
+    Возвращает (True, тип_прокси, IP) если успешно.
     """
     proxy_type = "http"
     if proxy_str.startswith("socks5://") or proxy_str.startswith("socks://"):
         proxy_type = "socks5"
-    elif not proxy_str.startswith(("http://", "https://", "socks5://", "socks://")):
+    elif proxy_str.startswith(("http://", "https://")):
+        proxy_type = "http"
+    else:
         if "@" in proxy_str:
             parts = proxy_str.split("@")
-            if len(parts) == 2:
-                ip_port = parts[1]
-                if ":" in ip_port:
-                    proxy_str = f"socks5://{parts[0]}@{ip_port}"
-                else:
-                    return False, "Неверный формат. Нужно: login:pass@ip:port"
+            if len(parts) == 2 and ":" in parts[1]:
+                proxy_str = f"socks5://{parts[0]}@{parts[1]}"
+                proxy_type = "socks5"
             else:
                 return False, "Неверный формат. Нужно: login:pass@ip:port"
         else:
             if ":" in proxy_str:
                 proxy_str = f"socks5://{proxy_str}"
+                proxy_type = "socks5"
             else:
-                return False, "Неверный формат. Нужно: ip:port или login:pass@ip:port"
-        proxy_type = "socks5"
+                return False, "Неверный формат. Нужно: ip:port"
 
     try:
         async with async_playwright() as p:
@@ -229,16 +228,23 @@ async def check_proxy(proxy_str: str) -> tuple:
             )
             context = await browser.new_context()
             page = await context.new_page()
-            await page.goto("https://whoer.net", timeout=15000)
-            await asyncio.sleep(3)
-            ip_element = await page.query_selector('#ip')
-            country_element = await page.query_selector('#country')
-            ip = await ip_element.text_content() if ip_element else "не определен"
-            country = await country_element.text_content() if country_element else "не определена"
+            await page.goto("https://api.ipify.org?format=json", timeout=10000)
+            content = await page.text_content("body")
+            try:
+                ip_data = json.loads(content)
+                ip = ip_data.get("ip", "не определен")
+            except:
+                ip = content.strip() if content else "не определен"
             await browser.close()
-            return True, proxy_type, country.strip(), ip.strip()
+            return True, proxy_type, ip
     except Exception as e:
-        return False, str(e)[:100]
+        error_msg = str(e)
+        if "ERR_SOCKS" in error_msg:
+            return False, "Ошибка SOCKS: прокси не поддерживается или требует авторизации. Попробуй http://..."
+        elif "timeout" in error_msg.lower():
+            return False, "Таймаут: прокси не отвечает или слишком медленный"
+        else:
+            return False, f"Ошибка: {error_msg[:80]}"
 
 # ========== ОСНОВНАЯ ЭМУЛЯЦИЯ ==========
 async def emulate_payment(session_id, code=None, screenshot_only=False):
@@ -471,19 +477,18 @@ async def handle_all_reply(msg: types.Message):
         return
 
     if "прокси" in text:
-        await msg.reply("🔄 Проверяю прокси через whoer.net...")
+        await msg.reply("🔄 Проверяю прокси...")
         ok, *result = await check_proxy(user_input)
         if ok:
             set_setting('proxy', user_input)
-            proxy_type, country, ip = result
+            proxy_type, ip = result
             await msg.reply(
                 f"✅ Прокси сохранён:\n"
                 f"📌 Тип: {proxy_type.upper()}\n"
-                f"🌍 Страна: {country}\n"
-                f"📡 IP: {ip}"
+                f"📡 Ваш IP через прокси: {ip}"
             )
         else:
-            await msg.reply(f"❌ Прокси не отвечает: {result[0]}")
+            await msg.reply(f"❌ Прокси не работает: {result[0]}")
         return
 
     if "ссылку для ротации" in text:
