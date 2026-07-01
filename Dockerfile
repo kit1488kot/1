@@ -2,7 +2,6 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Устанавливаем системные зависимости
 RUN apt-get update && apt-get install -y \
     curl \
     wget \
@@ -17,7 +16,7 @@ RUN apt-get update && apt-get install -y \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
     libcups2 \
-    libgio2.0-0 \
+    libgio-2.0-0 \
     libdrm2 \
     libexpat1 \
     libxcb1 \
@@ -38,7 +37,6 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Устанавливаем браузер Chromium
 RUN playwright install chromium
 
 COPY bot.py .
