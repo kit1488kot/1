@@ -2,9 +2,11 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Устанавливаем системные зависимости для Playwright
+# Устанавливаем системные зависимости
 RUN apt-get update && apt-get install -y \
     curl \
+    wget \
+    gnupg \
     libgobject-2.0-0 \
     libglib2.0-0 \
     libnss3 \
@@ -36,7 +38,8 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN playwright install chromium && playwright install-deps
+# Устанавливаем браузер Chromium
+RUN playwright install chromium
 
 COPY bot.py .
 
